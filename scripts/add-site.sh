@@ -49,9 +49,11 @@ else
     warn "nginx 未运行，配置会在 docker compose up -d 后生效"
 fi
 
+ensure_dns_record "$SITE_DOMAIN" || true
+
 echo
 log "检查清单："
-echo "  1. DNS：$SITE_DOMAIN 的 A/AAAA 记录指向本机（Cloudflare 灰云 / 仅 DNS）"
+echo "  1. DNS：已检查/创建 $SITE_DOMAIN 的 Cloudflare 灰云记录（如未托管在当前 Token 下请手动添加）"
 if [ -n "$APP" ]; then
     echo "  2. 应用：apps/$APP 已在 $UPSTREAM 运行；以后改了代码运行 edge up $APP"
 else

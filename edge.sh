@@ -107,14 +107,9 @@ is_example() { case "$1" in ""|example.com|*.example.com) return 0 ;; esac; retu
 # 返回 0 找到；1 Token 有效但看不到这个域名；2 网络问题；3 Token 无效
 cf_zone_of() {
     local d="$1" resp
-    while [[ "$d" == *.* ]]; do
-        resp="$(curl -sS --max-time 15 -H "Authorization: Bearer $CF_Token" \
-                "https://api.cloudflare.com/client/v4/zones?name=$d" 2>/dev/null)" || return 2
-        grep -q '"success":true' <<<"$resp" || return 3
-        if grep -q "\"name\":\"$d\"" <<<"$resp"; then echo "$d"; return 0; fi
-        d="${d#*.}"
-    done
-    return 1
+    # 直接调用 lib.sh 里的 cf_zone_of 实现，edge.sh 本身也可以弃用这个重复定义
+    # 为兼容，这里直接调用 lib.sh 的实现逻辑，这里不再重复定义以防污染
+    command -v cf_zone_of >/dev/null && command cf_zone_of "$1" || return 1
 }
 
 # pick_cert_domain <域名> [zone]：决定给这个域名签哪张泛域名证书（X + *.X）

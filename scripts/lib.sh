@@ -116,6 +116,152 @@ port_ok() {
         && [ "$1" != 443 ] && [ "$1" != 8443 ] && [ "$1" != 10443 ]
 }
 
+# ---------------------------------------------------------------- Cloudflare DNS（只支持灰云 proxied=false）
+# cf_zone_lookup <域名>：从域名本身逐级向上查 Cloudflare zone，打印 "<zone_id> <zone_name>"
+# 返回 0 找到；1 Token 有效但看不到这个域名；2 网络或 jq 问题；3 Token 无效
+cf_zone_lookup() {
+    local d="$1" resp zid zname
+    command -v jq >/dev/null || return 2
+    while [[ "$d" == *.* ]]; do
+        resp="$(curl -sS --max-time 15 -H "Authorization: Bearer $CF_Token" \
+                "https://api.cloudflare.com/client/v4/zones?name=$d" 2>/dev/null)" || return 2
+        jq -e '.success == true' >/dev/null 2>&1 <<<"$resp" || return 3
+        zid="$(jq -r '.result[0].id // empty' <<<"$resp")"
+        zname="$(jq -r '.result[0].name // empty' <<<"$resp")"
+        if [ -n "$zid" ] && [ "$zname" = "$d" ]; then
+            echo "$zid $zname"
+            return 0
+        fi
+        d="${d#*.}"
+    done
+    return 1
+}
+
+# cf_zone_of <域名>：只打印 zone 名（供 edge.sh 选证书根域名、校验 Token）
+cf_zone_of() {
+    local out rc
+    out="$(cf_zone_lookup "$1")" && rc=0 || rc=$?
+    [ "$rc" -eq 0 ] && echo "${out#* }"
+    return "$rc"
+}
+
+# public_ipv4 / public_ipv6：获取本机公网出口 IP（缓存到进程内变量，批量补齐时只查一次）
+_PUB_IPV4_DONE=0 _PUB_IPV4=""
+_PUB_IPV6_DONE=0 _PUB_IPV6=""
+public_ipv4() {
+    if [ "$_PUB_IPV4_DONE" -eq 0 ]; then
+        _PUB_IPV4_DONE=1
+        _PUB_IPV4="$(curl -4 -sS --max-time 8 "$TRACE_URL" 2>/dev/null | sed -n 's/^ip=//p')" || true
+        [[ "$_PUB_IPV4" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] || _PUB_IPV4=""
+    fi
+    [ -n "$_PUB_IPV4" ] && echo "$_PUB_IPV4"
+}
+
+public_ipv6() {
+    if [ "$_PUB_IPV6_DONE" -eq 0 ]; then
+        _PUB_IPV6_DONE=1
+        _PUB_IPV6="$(curl -6 -sS --max-time 8 "$TRACE_URL" 2>/dev/null | sed -n 's/^ip=//p')" || true
+        [[ "$_PUB_IPV6" == *:* ]] || _PUB_IPV6=""
+    fi
+    [ -n "$_PUB_IPV6" ] && echo "$_PUB_IPV6"
+}
+
+# _cf_ensure_one <zone_id> <域名> <A|AAAA> <本机IP>：单条灰云记录幂等检查与创建
+_cf_ensure_one() {
+    local zid="$1" domain="$2" rtype="$3" ip="$4" resp count cur proxied payload msg
+    resp="$(curl -sS --max-time 15 -H "Authorization: Bearer $CF_Token" \
+            "https://api.cloudflare.com/client/v4/zones/$zid/dns_records?name=$domain&type=$rtype" 2>/dev/null)" || {
+        warn "查询 Cloudflare DNS（$domain $rtype）失败：网络超时"
+        return 1
+    }
+    if ! jq -e '.success == true' >/dev/null 2>&1 <<<"$resp"; then
+        msg="$(jq -r '.errors[0].message // "未知错误"' 2>/dev/null <<<"$resp")"
+        warn "查询 Cloudflare DNS（$domain $rtype）失败：$msg"
+        return 1
+    fi
+    count="$(jq -r '.result | length' <<<"$resp")"
+    if [ "$count" -gt 0 ]; then
+        cur="$(jq -r '.result[0].content // empty' <<<"$resp")"
+        proxied="$(jq -r '.result[0].proxied // false' <<<"$resp")"
+        if [ "$proxied" = "true" ]; then
+            warn "DNS $rtype 记录 $domain 已存在，但开了橙云（代理）！本方案只支持灰云（仅 DNS），请到 Cloudflare 关掉小云朵"
+        elif [ "$cur" != "$ip" ]; then
+            warn "DNS $rtype 记录 $domain 已存在（当前指向 $cur，本机公网 IP 为 $ip），未覆盖"
+        else
+            log "DNS $rtype 记录 $domain → $ip（灰云）已就绪"
+        fi
+        return 0
+    fi
+
+    # 不存在同名 CNAME 时才可直接建 A/AAAA；若已有 CNAME，Cloudflare 会返回明确报错，下面直接打印原因
+    payload="$(jq -nc --arg t "$rtype" --arg n "$domain" --arg c "$ip" \
+        '{type: $t, name: $n, content: $c, ttl: 1, proxied: false}')"
+    resp="$(curl -sS --max-time 15 -X POST \
+            -H "Authorization: Bearer $CF_Token" \
+            -H "Content-Type: application/json" \
+            --data "$payload" \
+            "https://api.cloudflare.com/client/v4/zones/$zid/dns_records" 2>/dev/null)" || {
+        warn "创建 Cloudflare DNS（$domain $rtype）失败：网络超时"
+        return 1
+    }
+    if jq -e '.success == true' >/dev/null 2>&1 <<<"$resp"; then
+        log "已在 Cloudflare 自动创建 DNS $rtype 记录：$domain → $ip（灰云）"
+        return 0
+    fi
+    msg="$(jq -r '.errors[0].message // "未知错误"' 2>/dev/null <<<"$resp")"
+    warn "创建 DNS $rtype 记录 $domain 失败：$msg（请检查 Token 是否有 Zone → DNS → Edit 权限，或手动添加灰云记录）"
+    return 1
+}
+
+# ensure_dns_record <域名>：确保该域名在 Cloudflare 上有指向本机的灰云 A（及按 ENABLE_IPV6 决定的 AAAA）记录
+# 失败只打印 warn 不退出，避免网络抖动或外部独立管理的域名卡死站点创建/重载
+ensure_dns_record() {
+    local domain="$1" out zid rc ip4="" ip6="" want_v6=0
+    if [ -z "${CF_Token:-}" ]; then
+        warn ".env 未填写 CF_Token，跳过自动创建 $domain 的 DNS 记录"
+        return 1
+    fi
+    if ! command -v jq >/dev/null; then
+        warn "未安装 jq（运行 edge install 会自动补装），跳过自动创建 $domain 的 DNS 记录"
+        return 1
+    fi
+    out="$(cf_zone_lookup "$domain")" && rc=0 || rc=$?
+    case "$rc" in
+        0) zid="${out%% *}" ;;
+        1) warn "Cloudflare Token 看不到 $domain 所在的根域名，跳过自动创建 DNS 记录（请手动添加灰云记录或检查 Zone Resources）"; return 1 ;;
+        3) warn "Cloudflare Token 无效或缺少 Zone → Zone → Read 权限，跳过自动创建 $domain 的 DNS 记录"; return 1 ;;
+        *) warn "连接 Cloudflare API 失败，跳过自动创建 $domain 的 DNS 记录"; return 1 ;;
+    esac
+
+    ip4="$(public_ipv4 || true)"
+    case "${ENABLE_IPV6:-auto}" in
+        true)  want_v6=1 ;;
+        false) want_v6=0 ;;
+        *)     [ -s /proc/net/if_inet6 ] && want_v6=1 ;;
+    esac
+    [ "$want_v6" -eq 1 ] && ip6="$(public_ipv6 || true)"
+
+    if [ -z "$ip4" ] && [ -z "$ip6" ]; then
+        warn "无法获取本机公网 IP，跳过自动创建 $domain 的 DNS 记录"
+        return 1
+    fi
+    [ -n "$ip4" ] && _cf_ensure_one "$zid" "$domain" A "$ip4" || true
+    [ -n "$ip6" ] && _cf_ensure_one "$zid" "$domain" AAAA "$ip6" || true
+    return 0
+}
+
+# ensure_all_sites_dns：为伪装站 + 所有已发布业务站点补齐灰云 DNS 记录（edge install / edge apply 时自动调用）
+ensure_all_sites_dns() {
+    local f d
+    [ -n "${REALITY_SNI:-}" ] && ensure_dns_record "$REALITY_SNI" || true
+    for f in "$CONF_DIR"/*.conf; do
+        [ -e "$f" ] || continue
+        d="$(basename "$f" .conf)"
+        [ "$d" = "00-decoy" ] && continue
+        ensure_dns_record "$d" || true
+    done
+}
+
 # ---------------------------------------------------------------- apps/ 下的应用
 # 约定：每个应用一个目录 apps/<名字>/，里面有 compose.yaml，端口写成
 #   "127.0.0.1:${APP_PORT}:容器端口"

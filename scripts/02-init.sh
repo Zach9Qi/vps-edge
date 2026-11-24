@@ -190,6 +190,12 @@ T="$EDGE_DIR/templates/xray"
 relays_load
 NRELAY=${#RELAY_NAMES[@]}
 
+# ---------- DNS 自动记录 ----------
+if [ "$EDGE_ROLE" = edge ]; then
+    log "同步所有站点的 Cloudflare DNS 记录"
+    ensure_all_sites_dns
+fi
+
 # 公网入口的用户：主 UUID（给手机等客户端）+ 每张通行证一个 UUID
 REALITY_CLIENTS="          { \"id\": \"$XRAY_UUID\", \"flow\": \"xtls-rprx-vision\", \"email\": \"default@edge\" }"
 SS_CLIENTS=""

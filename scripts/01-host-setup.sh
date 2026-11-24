@@ -7,13 +7,15 @@ require_root
 command -v docker >/dev/null || die "未检测到 docker"
 docker compose version >/dev/null 2>&1 || die "未检测到 docker compose 插件"
 
-# 本方案只依赖这四个，系统里已有的不会重复安装：
+# 本方案只依赖这五个，系统里已有的不会重复安装：
 #   curl      安装 acme.sh、调用 Cloudflare API
+#   jq        解析 Cloudflare API 返回的 JSON，自动创建灰云 DNS 记录
 #   openssl   生成 shortId、查看证书有效期
 #   cron      acme.sh 每日检查续期
 #   logrotate nginx 日志每日轮转
 missing=()
 command -v curl      >/dev/null || missing+=(curl)
+command -v jq        >/dev/null || missing+=(jq)
 command -v openssl   >/dev/null || missing+=(openssl)
 command -v crontab   >/dev/null || missing+=(cron)
 command -v logrotate >/dev/null || missing+=(logrotate)
@@ -24,7 +26,7 @@ if [ ${#missing[@]} -gt 0 ]; then
     apt-get update -qq
     apt-get install -y -qq --no-install-recommends "${missing[@]}" >/dev/null
 else
-    log "curl / openssl / cron / logrotate 都已存在，不需要安装任何包"
+    log "curl / jq / openssl / cron / logrotate 都已存在，不需要安装任何包"
 fi
 systemctl enable --now cron >/dev/null 2>&1 || true
 
