@@ -477,7 +477,7 @@ relay_index() {  # relay_index <名字>：输出它在数组里的下标；没�
 # ---------------------------------------------------------------- 分享链接
 # vless_link <UUID> <节点名>：本机公网入口（REALITY）的分享链接（需要 load_keys）
 vless_link() {
-    printf 'vless://%s@%s:443?encryption=none&flow=xtls-rprx-vision&security=reality&sni=%s&fp=chrome&pbk=%s&sid=%s&type=tcp&headerType=none#%s' \
+    printf 'vless://%s@%s:443?encryption=none&flow=xtls-rprx-vision&security=reality&sni=%s&fp=chrome&pbk=%s&sid=%s&type=tcp&headerType=none&support-x25519mlkem768=1#%s' \
         "$1" "$REALITY_SNI" "$REALITY_SNI" "$XRAY_PUBLIC_KEY" "$XRAY_SHORT_ID" "$(urlencode "$2")"
 }
 

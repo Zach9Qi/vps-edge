@@ -42,6 +42,7 @@ proxies:
     reality-opts:
       public-key: ${XRAY_PUBLIC_KEY}
       short-id: ${XRAY_SHORT_ID}
+      support-x25519mlkem768: true
 ============================================
 EOF
 else
