@@ -1,0 +1,8 @@
+# 伪装站应用：由 edge 自动构建、启动（edge install / apply / up / update），不用手动运行
+# 端口 APP_PORT 由 edge 传入（来自 .env 的 DECOY_PORT），只绑定 127.0.0.1
+services:
+  web:
+    build: .
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:${APP_PORT:?端口由 edge 传入，请用 edge apply 或 edge up decoy 启动}:80"
