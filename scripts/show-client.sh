@@ -1,29 +1,16 @@
 #!/usr/bin/env bash
-# 输出客户端配置：VLESS 分享链接 + mihomo (Clash Meta) 配置片段
+# 输出客户端配置：VLESS 分享链接 + mihomo (Clash Meta) 配置片段；以及链式代理的状态
 . "$(cd "$(dirname "$0")" && pwd)/lib.sh"
 load_env
 load_keys
 
-# urlencode <文本>：按 UTF-8 字节做百分号编码（中文、空格、emoji 都可以放进分享链接的 #节点名）
-urlencode() {
-    local b c out=""
-    for b in $(printf '%s' "$1" | od -An -v -tx1); do
-        case "$b" in
-            3[0-9]|4[1-9a-f]|5[0-9a]|6[1-9a-f]|7[0-9a]|2d|2e|5f|7e)
-                printf -v c "\\x$b"; out+="$c" ;;       # 字母、数字、- . _ ~ 原样保留
-            *)  out+="%${b^^}" ;;
-        esac
-    done
-    printf '%s' "$out"
-}
+if [ "$EDGE_ROLE" = edge ]; then
+    # YAML 双引号字符串：转义 \ 和 "
+    NODE_NAME_YAML="${NODE_NAME//\\/\\\\}"
+    NODE_NAME_YAML="${NODE_NAME_YAML//\"/\\\"}"
+    LINK="$(vless_link "$XRAY_UUID" "$NODE_NAME")"
 
-# YAML 双引号字符串：转义 \ 和 "
-NODE_NAME_YAML="${NODE_NAME//\\/\\\\}"
-NODE_NAME_YAML="${NODE_NAME_YAML//\"/\\\"}"
-
-LINK="vless://${XRAY_UUID}@${REALITY_SNI}:443?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${REALITY_SNI}&fp=chrome&pbk=${XRAY_PUBLIC_KEY}&sid=${XRAY_SHORT_ID}&type=tcp&headerType=none#$(urlencode "$NODE_NAME")"
-
-cat <<EOF
+    cat <<EOF
 ================ 客户端配置 ================
 地址 (address)     : ${REALITY_SNI}
 端口 (port)        : 443
@@ -57,3 +44,31 @@ proxies:
       short-id: ${XRAY_SHORT_ID}
 ============================================
 EOF
+else
+    cat <<'EOF'
+================ 内网出口模式 ================
+这台机器只给同一内网里的入口机当出口（EDGE_ROLE=exit），没有给手机直接用的链接。
+入口机要用的链接通过"通行证"发放：
+  edge relay add <名字>     发一张通行证，打印链接
+  edge relay list           查看已发的通行证
+==============================================
+EOF
+fi
+
+# ---------- 链式代理状态（只在用到时显示）----------
+relays_load
+if [ -n "$UPSTREAM" ] || [ "${#RELAY_NAMES[@]}" -gt 0 ] || [ -n "$EXIT_LISTEN" ]; then
+    echo
+    echo "---- 链式代理 ----"
+    if [ -n "$UPSTREAM" ]; then
+        if upstream_parse "$UPSTREAM" 2>/dev/null; then
+            echo "出口      : 经上游 $UP_DESC（本机不直连任何网站）"
+        else
+            echo "出口      : UPSTREAM 链接有问题，运行 edge upstream 查看"
+        fi
+    else
+        echo "出口      : 本机直接出网"
+    fi
+    if [ -n "$EXIT_LISTEN" ]; then echo "内网入口  : $EXIT_LISTEN"; fi
+    echo "通行证    : ${#RELAY_NAMES[@]} 张（edge relay list 查看，edge relay show <名字> 显示链接）"
+fi

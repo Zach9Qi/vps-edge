@@ -1,8 +1,15 @@
 #!/usr/bin/env bash
 # 生成 Xray 密钥（只在第一次生成，之后复用）并渲染 nginx / xray 配置
 # 用法：
-#   bash scripts/02-init.sh                 # 首次初始化，或修改 .env / 模板后重新渲染
+#   bash scripts/02-init.sh                 # 首次初始化，或修改 .env / 模板 / 通行证后重新渲染
 #   bash scripts/02-init.sh --rotate-keys   # 重新生成 UUID、密钥、shortId（旧客户端会失效）
+#
+# Xray 配置由几块拼成（都在 templates/ 下）：
+#   xray-config.json.tpl            外框
+#   xray/inbound-reality.json.tpl   公网入口（完整节点才有）
+#   xray/inbound-internal.json.tpl  内网入口（.env 填了 EXIT_LISTEN 且发过通行证才有）
+#   xray/egress-direct.json.tpl     直接出网 + 拦截规则（没填 UPSTREAM 时）
+#   xray/egress-upstream.json.tpl   全部转给上游（填了 UPSTREAM 时）
 . "$(cd "$(dirname "$0")" && pwd)/lib.sh"
 load_env
 
@@ -13,15 +20,31 @@ command -v docker >/dev/null || die "未检测到 docker"
 command -v openssl >/dev/null || die "未检测到 openssl"
 
 # ---------- 检查 .env ----------
-case "$REALITY_SNI" in
-    example.com|*.example.com) die ".env 里还是示例域名：运行 bash edge.sh 按提示填写，或手动修改 REALITY_SNI / REALITY_CERT_DOMAIN" ;;
-esac
-cert_covers "$REALITY_SNI" "$REALITY_CERT_DOMAIN" \
-    || die "REALITY_SNI=$REALITY_SNI 不在 $REALITY_CERT_DOMAIN 泛域名证书的覆盖范围内（只覆盖根域名和一级子域名）"
-[ "$REALITY_SNI" != "$REALITY_CERT_DOMAIN" ] \
-    || warn "REALITY_SNI 用的是根域名，建议改用专用子域名（如 www.$REALITY_CERT_DOMAIN）"
-port_ok "$DECOY_PORT" \
-    || die ".env 里 DECOY_PORT=${DECOY_PORT:-（空）} 不对：填 1-65535 之间的端口（如 3000），不能用 443 / 8443 / 10443"
+if [ "$EDGE_ROLE" = edge ]; then
+    case "$REALITY_SNI" in
+        example.com|*.example.com) die ".env 里还是示例域名：运行 bash edge.sh 按提示填写，或手动修改 REALITY_SNI / REALITY_CERT_DOMAIN" ;;
+    esac
+    cert_covers "$REALITY_SNI" "$REALITY_CERT_DOMAIN" \
+        || die "REALITY_SNI=$REALITY_SNI 不在 $REALITY_CERT_DOMAIN 泛域名证书的覆盖范围内（只覆盖根域名和一级子域名）"
+    [ "$REALITY_SNI" != "$REALITY_CERT_DOMAIN" ] \
+        || warn "REALITY_SNI 用的是根域名，建议改用专用子域名（如 www.$REALITY_CERT_DOMAIN）"
+    port_ok "$DECOY_PORT" \
+        || die ".env 里 DECOY_PORT=${DECOY_PORT:-（空）} 不对：填 1-65535 之间的端口（如 3000），不能用 443 / 8443 / 10443"
+else
+    [ -n "$EXIT_LISTEN" ] || die "出口模式（EDGE_ROLE=exit）必须在 .env 填写 EXIT_LISTEN=内网IP:端口，或者运行 edge internal 设置"
+    DECOY_PORT=""
+fi
+if [ -n "$EXIT_LISTEN" ]; then
+    exit_listen_check "$EXIT_LISTEN" || die ".env 里 EXIT_LISTEN 不对（原因见上）：运行 edge internal 重新设置"
+fi
+if [ -n "$UPSTREAM" ]; then
+    upstream_parse "$UPSTREAM" || die ".env 里 UPSTREAM 的链接不对（原因见上）：运行 edge upstream '<链接>' 重新设置，或 edge upstream off 取消"
+    if [ "$UP_HOST" = "$REALITY_SNI" ] || [ "$UP_HOST" = "${EXIT_IP:-}" ]; then
+        die "UPSTREAM 指向的是本机（$UP_HOST）：上游必须是另一台机器"
+    fi
+    # edge upstream 设置时已经提醒过一次，这里不再重复
+    [ -z "$UP_WARN" ] || [ "${EDGE_UPSTREAM_WARNED:-0}" = 1 ] || warn "$UP_WARN"
+fi
 
 # 旧版本用的是 teddysun/xray：它的启动方式和官方镜像不同，跟现在的 docker-compose.yml 不兼容，自动切换
 if [[ "$XRAY_IMAGE" == teddysun/* ]]; then
@@ -34,10 +57,10 @@ mkdir -p "$EDGE_DIR"/{nginx/conf.d,certs,xray,logs/nginx}
 chmod 600 "$EDGE_DIR/.env"
 chmod +x "$EDGE_DIR"/scripts/*.sh
 
-# ---------- 证书必须先就位 ----------
+# ---------- 证书必须先就位（只有完整节点需要）----------
 # 伪装站配置会引用 certs/$REALITY_CERT_DOMAIN/：证书不存在时先签发，签不下来就不渲染，
 # 否则 nginx -t 会一直失败，nginx 容器重启后也起不来（网站和代理一起中断）
-if [ ! -s "$EDGE_DIR/certs/$REALITY_CERT_DOMAIN/fullchain.pem" ]; then
+if [ "$EDGE_ROLE" = edge ] && [ ! -s "$EDGE_DIR/certs/$REALITY_CERT_DOMAIN/fullchain.pem" ]; then
     log "还没有 $REALITY_CERT_DOMAIN 的证书，先签发"
     bash "$EDGE_DIR/scripts/03-issue-cert.sh" "$REALITY_CERT_DOMAIN" \
         || die "证书签发失败，未改动现有配置；处理好后重新运行本脚本"
@@ -45,18 +68,6 @@ fi
 
 # ---------- Xray 密钥 ----------
 b64url() { base64 | tr '+/' '-_' | tr -d '=\n'; }
-
-# UUID v4：优先读内核，否则用 openssl 随机数拼出来
-gen_uuid() {
-    if [ -r /proc/sys/kernel/random/uuid ]; then
-        cat /proc/sys/kernel/random/uuid
-        return
-    fi
-    local h
-    h="$(openssl rand -hex 16)"
-    printf '%s-%s-4%s-%x%s-%s\n' "${h:0:8}" "${h:8:4}" "${h:13:3}" \
-        $(( (0x${h:16:1} & 3) | 8 )) "${h:17:3}" "${h:20:12}"
-}
 
 gen_x25519() {
     local out tmp
@@ -122,11 +133,18 @@ fi
 if [ -f "$KEYS_FILE" ]; then
     log "复用已有密钥 $KEYS_FILE"
     load_keys
+    # 旧版本的 keys.env 没有内网入口的服务端密钥：补上（不影响已有的 UUID / REALITY 密钥）
+    if [ -z "${SS_SERVER_KEY:-}" ]; then
+        SS_SERVER_KEY="$(gen_ss_key)"
+        printf 'SS_SERVER_KEY=%s\n' "$SS_SERVER_KEY" >>"$KEYS_FILE"
+        log "已补充内网入口用的服务端密钥（SS_SERVER_KEY）"
+    fi
 else
     log "生成 Xray UUID / X25519 密钥 / shortId"
     XRAY_UUID="$(gen_uuid)"
     gen_x25519
     XRAY_SHORT_ID="$(openssl rand -hex 8)"
+    SS_SERVER_KEY="$(gen_ss_key)"
     umask 077
     cat >"$KEYS_FILE" <<EOF
 # 由 02-init.sh 生成，请妥善备份；泄露后用 --rotate-keys 轮换
@@ -134,43 +152,90 @@ XRAY_UUID=$XRAY_UUID
 XRAY_PRIVATE_KEY=$XRAY_PRIVATE_KEY
 XRAY_PUBLIC_KEY=$XRAY_PUBLIC_KEY
 XRAY_SHORT_ID=$XRAY_SHORT_ID
+SS_SERVER_KEY=$SS_SERVER_KEY
 EOF
     umask 022
 fi
 
-# ---------- IPv6 ----------
-case "$ENABLE_IPV6" in
-    true)  USE_V6=1 ;;
-    false) USE_V6=0 ;;
-    *)     if [ -s /proc/net/if_inet6 ]; then USE_V6=1; else USE_V6=0; fi ;;
-esac
-if [ "$USE_V6" -eq 1 ]; then
-    STREAM_LISTEN_V6="listen [::]:443 reuseport;"
-    log "nginx 将同时监听 IPv6 443"
-else
-    STREAM_LISTEN_V6="# IPv6 未启用（.env 中 ENABLE_IPV6）"
-    log "nginx 只监听 IPv4 443"
+# ---------- nginx（只有完整节点需要）----------
+if [ "$EDGE_ROLE" = edge ]; then
+    case "$ENABLE_IPV6" in
+        true)  USE_V6=1 ;;
+        false) USE_V6=0 ;;
+        *)     if [ -s /proc/net/if_inet6 ]; then USE_V6=1; else USE_V6=0; fi ;;
+    esac
+    if [ "$USE_V6" -eq 1 ]; then
+        STREAM_LISTEN_V6="listen [::]:443 reuseport;"
+        log "nginx 将同时监听 IPv6 443"
+    else
+        STREAM_LISTEN_V6="# IPv6 未启用（.env 中 ENABLE_IPV6）"
+        log "nginx 只监听 IPv4 443"
+    fi
+
+    render "$EDGE_DIR/templates/nginx.conf.tpl" "$EDGE_DIR/nginx/nginx.conf" \
+        REALITY_SNI STREAM_LISTEN_V6
+    # 伪装站：反向代理到 apps/decoy（和业务站点用同一个模板）
+    SITE_DOMAIN="$REALITY_SNI"
+    UPSTREAM_ADDR="127.0.0.1:$DECOY_PORT"
+    CERT_DOMAIN="$REALITY_CERT_DOMAIN"
+    UPSTREAM_SAVED="$UPSTREAM" UPSTREAM="$UPSTREAM_ADDR"    # site.conf.tpl 用的是 __UPSTREAM__（反代后端）
+    render "$EDGE_DIR/templates/site.conf.tpl" "$EDGE_DIR/nginx/conf.d/00-decoy.conf" \
+        SITE_DOMAIN UPSTREAM CERT_DOMAIN
+    UPSTREAM="$UPSTREAM_SAVED"
+    log "伪装站：反向代理到 $UPSTREAM_ADDR"
 fi
 
-# ---------- 渲染配置 ----------
-render "$EDGE_DIR/templates/nginx.conf.tpl" "$EDGE_DIR/nginx/nginx.conf" \
-    REALITY_SNI STREAM_LISTEN_V6
-# 伪装站：反向代理到 apps/decoy（和业务站点用同一个模板）
-SITE_DOMAIN="$REALITY_SNI"
-UPSTREAM="127.0.0.1:$DECOY_PORT"
-CERT_DOMAIN="$REALITY_CERT_DOMAIN"
-render "$EDGE_DIR/templates/site.conf.tpl" "$EDGE_DIR/nginx/conf.d/00-decoy.conf" \
-    SITE_DOMAIN UPSTREAM CERT_DOMAIN
-log "伪装站：反向代理到 $UPSTREAM"
+# ---------- Xray ----------
+T="$EDGE_DIR/templates/xray"
+relays_load
+NRELAY=${#RELAY_NAMES[@]}
+
+# 公网入口的用户：主 UUID（给手机等客户端）+ 每张通行证一个 UUID
+REALITY_CLIENTS="          { \"id\": \"$XRAY_UUID\", \"flow\": \"xtls-rprx-vision\", \"email\": \"default@edge\" }"
+SS_CLIENTS=""
+for i in "${!RELAY_NAMES[@]}"; do
+    REALITY_CLIENTS+=$',\n'"          { \"id\": \"${RELAY_UUIDS[$i]}\", \"flow\": \"xtls-rprx-vision\", \"email\": \"relay-${RELAY_NAMES[$i]}@edge\" }"
+    SS_CLIENTS+="${SS_CLIENTS:+$',\n'}          { \"password\": \"${RELAY_SSKEYS[$i]}\", \"email\": \"relay-${RELAY_NAMES[$i]}@edge\" }"
+done
+
+XRAY_INBOUNDS=""
+if [ "$EDGE_ROLE" = edge ]; then
+    XRAY_INBOUNDS="$(render_text "$T/inbound-reality.json.tpl" \
+        REALITY_CLIENTS REALITY_SNI XRAY_PRIVATE_KEY XRAY_SHORT_ID)"
+fi
+if [ -n "$EXIT_LISTEN" ]; then
+    # 一张通行证都没有时不开内网入口：Shadowsocks 2022 没有用户时会退化成单用户模式，
+    # 只凭服务端密钥就能连，已吊销的入口机手里正好有这个密钥
+    if [ "$NRELAY" -gt 0 ]; then
+        frag="$(render_text "$T/inbound-internal.json.tpl" EXIT_IP EXIT_PORT SS_METHOD SS_SERVER_KEY SS_CLIENTS)"
+        XRAY_INBOUNDS+="${XRAY_INBOUNDS:+$',\n'}$frag"
+        log "内网入口：$EXIT_IP:$EXIT_PORT（$NRELAY 张通行证）"
+    else
+        warn "内网入口 $EXIT_IP:$EXIT_PORT 还没有发过通行证，暂不监听：运行 edge relay add <名字>"
+    fi
+fi
+
+if [ -n "$UPSTREAM" ]; then
+    UPSTREAM_OUTBOUND="$UP_OUTBOUND"
+    XRAY_EGRESS="$(render_text "$T/egress-upstream.json.tpl" UPSTREAM_OUTBOUND)"
+    log "出口：全部经上游 $UP_DESC（本机不直连）"
+else
+    XRAY_EGRESS="$(render_text "$T/egress-direct.json.tpl")"
+fi
+
 render "$EDGE_DIR/templates/xray-config.json.tpl" "$EDGE_DIR/xray/config.json" \
-    XRAY_UUID XRAY_PRIVATE_KEY XRAY_SHORT_ID REALITY_SNI
+    XRAY_INBOUNDS XRAY_EGRESS
 # 官方镜像以 UID 65532 运行：属主 root、属组 65532、640，容器能读，宿主机其他用户读不到
 chown "0:$XRAY_UID" "$EDGE_DIR/xray/config.json"
 chmod 640 "$EDGE_DIR/xray/config.json"
-log "已生成 nginx/nginx.conf、nginx/conf.d/00-decoy.conf、xray/config.json"
+if [ "$EDGE_ROLE" = edge ]; then
+    log "已生成 nginx/nginx.conf、nginx/conf.d/00-decoy.conf、xray/config.json"
+else
+    log "已生成 xray/config.json（出口模式：不需要 nginx）"
+fi
 
 # ---------- 检查新配置：不通过就恢复旧配置（见上面的 on_exit）----------
-if nginx_running; then
+if [ "$EDGE_ROLE" = edge ] && nginx_running; then
     docker exec nginx nginx -t -q || die "新生成的 nginx 配置检查不通过（报错见上）"
     log "nginx 配置检查通过"
 fi
@@ -186,22 +251,35 @@ else
 fi
 COMMITTED=1
 
-# ---------- 伪装站应用：按 DECOY_PORT 构建并启动（端口改了会自动重建）----------
-# 失败只提醒：应用没起来不影响代理，只是访问伪装站会看到 502
-decoy_up || warn "伪装站应用启动失败（代理不受影响）：cd apps/decoy && docker compose logs 查看原因，处理后运行 edge apply"
-
 # ---------- 生效 / 下一步 ----------
-if nginx_running; then
-    log "容器在运行：重载配置"
-    # 重建而不是 restart：.env 里换了 XRAY_IMAGE 或 compose 有改动时也能生效
-    (cd "$EDGE_DIR" && docker compose up -d --force-recreate xray) \
-        || warn "xray 容器重建失败：docker compose logs xray 查看原因"
-    # .env 里换了 NGINX_IMAGE 时重建 nginx（新配置上面已检查过）；没变化时这一步什么都不做
-    (cd "$EDGE_DIR" && docker compose up -d nginx) \
-        || warn "nginx 容器更新失败：docker compose logs nginx 查看原因"
-    bash "$EDGE_DIR/scripts/reload-nginx.sh"
+if [ "$EDGE_ROLE" = edge ]; then
+    # 伪装站应用：按 DECOY_PORT 构建并启动（端口改了会自动重建）
+    # 失败只提醒：应用没起来不影响代理，只是访问伪装站会看到 502
+    decoy_up || warn "伪装站应用启动失败（代理不受影响）：cd apps/decoy && docker compose logs 查看原因，处理后运行 edge apply"
+
+    if nginx_running; then
+        log "容器在运行：重载配置"
+        # 重建而不是 restart：.env 里换了 XRAY_IMAGE 或 compose 有改动时也能生效
+        (cd "$EDGE_DIR" && docker compose up -d --force-recreate xray) \
+            || warn "xray 容器重建失败：docker compose logs xray 查看原因"
+        # .env 里换了 NGINX_IMAGE 时重建 nginx（新配置上面已检查过）；没变化时这一步什么都不做
+        (cd "$EDGE_DIR" && docker compose up -d nginx) \
+            || warn "nginx 容器更新失败：docker compose logs nginx 查看原因"
+        bash "$EDGE_DIR/scripts/reload-nginx.sh"
+    else
+        next_step "docker compose up -d"
+    fi
 else
-    next_step "docker compose up -d"
+    if xray_exists; then
+        log "重建 xray 容器，让新配置生效"
+        (cd "$EDGE_DIR" && docker compose up -d --force-recreate xray) \
+            || warn "xray 容器重建失败：docker compose logs xray 查看原因"
+    else
+        next_step "docker compose up -d xray"
+    fi
+    if nginx_running; then
+        warn "出口模式不需要 nginx，但它还在运行：确认不再需要网站后，运行 docker compose stop nginx"
+    fi
 fi
 
 # 一键安装时，客户端配置在最后统一打印一次

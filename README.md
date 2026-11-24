@@ -8,6 +8,7 @@
 - **DNS**：所有域名都用 Cloudflare 灰云（仅 DNS）
 - **端口**：公网入站由 VPS 安全组控制，只放行 SSH 和 443/tcp
 - **依赖**：除 Docker 外只需要 curl、openssl、cron、logrotate（缺哪个才装哪个）
+- **链式代理**（可选）：多台机器串联，入口机把流量全部转给出口机，走公网或内网都行，两条命令完成配对（见第 8 节）
 
 **只需要记一个命令**：第一次运行 `bash edge.sh` 一键安装，之后输入 `edge` 打开菜单。
 
@@ -18,7 +19,7 @@
 cd /opt/edge && bash edge.sh
 ```
 
-脚本会问 4 个问题（伪装站域名、Cloudflare Token、邮箱、伪装站端口（默认 3000，回车即可）），然后自动完成：补装工具、开 BBR → 签证书 → 生成密钥和配置、启动伪装站应用 → 启动容器 → 健康检查 → 打印客户端分享链接。
+脚本先问这台机器的用途（完整节点 / 纯内网出口，默认完整节点，纯内网出口见 8.4 节），完整节点再问 4 个问题（伪装站域名、Cloudflare Token、邮箱、伪装站端口（默认 3000，回车即可）），然后自动完成：补装工具、开 BBR → 签证书 → 生成密钥和配置、启动伪装站应用 → 启动容器 → 健康检查 → 打印客户端分享链接。
 
 装完以后：
 
@@ -28,6 +29,7 @@ edge add blog.example.com blog 发布 apps/blog（自动分配端口、构建启
 edge up blog                  改了 apps/blog 的代码后重新构建、重启
 edge check                    健康检查
 edge client                   再看一次分享链接
+edge chain                    链式代理菜单（上游 / 通行证 / 内网入口）
 edge help                     所有命令
 ```
 
@@ -76,14 +78,20 @@ vps-edge/                       → 上传到 VPS 的 /opt/edge
 ├── templates/                  配置模板（由脚本渲染）
 │   ├── nginx.conf.tpl          主配置：stream 分流 + http 公共参数
 │   ├── site.conf.tpl           反向代理站点（业务站点和伪装站共用）
-│   └── xray-config.json.tpl    Xray 配置
+│   ├── xray-config.json.tpl    Xray 配置外框（下面几块按需拼进来）
+│   └── xray/
+│       ├── inbound-reality.json.tpl   公网入口：VLESS + REALITY（完整节点）
+│       ├── inbound-internal.json.tpl  内网入口：Shadowsocks 2022（开了内网入口且发过通行证时）
+│       ├── egress-direct.json.tpl     直接出网 + 拦截规则（没设上游时）
+│       └── egress-upstream.json.tpl   全部转给上游（设了上游时）
 ├── nginx/
 │   ├── snippets/               公共片段：安全响应头、反代参数
 │   ├── nginx.conf              ← 自动生成
 │   └── conf.d/                 ← 站点配置（00-decoy.conf 是伪装站，其余每个网站一个文件）
 ├── xray/
 │   ├── config.json             ← 自动生成
-│   └── keys.env                ← UUID / 密钥 / shortId（请备份）
+│   ├── keys.env                ← UUID / 密钥 / shortId / 内网入口密钥（请备份）
+│   └── relays.env              ← 已发出的通行证（edge relay 维护，请备份）
 ├── certs/<根域名>/             ← acme.sh 安装的证书
 ├── apps/                       应用，每个一个目录（edge 自动构建、启动，见第 5 节）
 │   └── decoy/                  伪装站
@@ -106,9 +114,15 @@ vps-edge/                       → 上传到 VPS 的 /opt/edge
 | `edge client` | 2 | 打印分享链接和 mihomo 配置片段 |
 | `edge apply` | 7 | 改了 `.env` 或模板之后重新生成配置，自动重载（密钥不变） |
 | `edge update` | 8 | 拉取 nginx / Xray 新镜像并重启，再 `edge up` 全部应用 |
-| `edge rotate-keys` | 10 | 轮换 Xray 密钥（旧客户端失效，需要重新导入） |
+| `edge rotate-keys` | 10 | 轮换 Xray 密钥（旧客户端和所有通行证的链接都失效，需要重新导入） |
 | `edge logs [nginx\|xray]` | | 实时查看日志 |
-| `edge xray [--raw]` | 11 | 查看 Xray 实际配置（私钥默认隐藏，`--raw` 显示完整），并提示配置是否已生效 |
+| `edge xray [--raw]` | 11 | 查看 Xray 实际配置（私钥、密码默认隐藏，`--raw` 显示完整），并提示配置是否已生效 |
+| `edge chain` | 12 | 链式代理菜单：上游、通行证、内网入口都在里面 |
+| `edge upstream ...` | 12 → 1~3 | 设置 / 测试 / 取消上游（本机流量全部转给另一台机器出去），见 8.6 节 |
+| `edge relay ...` | 12 → 4~6 | 发放 / 查看 / 吊销通行证（让别的机器把本机当上游），见 8.6 节 |
+| `edge internal ...` | 12 → 7~8 | 开启 / 修改 / 关闭内网入口（给同一内网的入口机用），见 8.6 节 |
+
+内网出口模式（`EDGE_ROLE=exit`）的菜单只有和 Xray、链式代理有关的项，网站相关的命令（`add` / `up` / `remove` / `sites` / `logs nginx`）不可用。
 
 `scripts/` 里的脚本是 edge 背后的分步实现（`01-host-setup` / `02-init` / `03-issue-cert` / `add-site` …），想单独调试某一步时仍然可以直接运行。`reload-nginx.sh` 会在证书续期后被 acme.sh 自动调用，不要改名或移动。
 
@@ -264,7 +278,318 @@ Token 被删除或权限被修改都会导致续期失败；`edge check` 会在�
 
 ---
 
-## 8. 日常运维
+## 8. 链式代理（多台机器串联）
+
+### 8.1 是什么
+
+```
+手机 ──► A（入口机）──► B（出口机）──► 目标网站
+         只转发，不直连      真正出网，网站看到的是 B 的 IP
+```
+
+- 手机照常连 A。A 设置了**上游**以后，把代理流量原样转给 B，自己**不直连任何目标网站**，连 DNS 都不查
+- A 上不做任何分流和拦截；拦截内网地址、拦截 BT 这些规则在真正出网的 B 上生效（B 用本项目部署时默认就有）
+- 只影响**代理流量**：A 本机自己的 `apt`、证书续期、`docker pull` 仍然直连
+- B 挂了，经过 A 的代理流量就上不了网，不会悄悄改成从 A 直连
+
+三个术语：
+
+| 术语 | 是什么 | 在哪台机器上操作 |
+|---|---|---|
+| **上游** | A 把流量转给谁。一条链接，存在 A 的 `.env` 的 `UPSTREAM` 里 | A：`edge upstream` |
+| **通行证** | B 发给 A 的独立凭据，A 拿它把 B 当上游。每张通行证包含一个 UUID（走公网用）和一个 SS 密钥（走内网用），和手机用的主 UUID 互不相干 | B：`edge relay` |
+| **内网入口** | B 在内网 IP 上开的 Shadowsocks 2022 入口，给同一内网里的 A 用；只监听内网 IP，不对公网开放 | B：`edge internal` |
+
+### 8.2 选哪种场景
+
+| 场景 | B 怎么部署 | A 用哪条链接 |
+|---|---|---|
+| **A、B 都用本项目，走公网**（见 8.3） | 完整节点，默认安装即可，什么都不用改 | B 上 `edge relay add` 打印的 `vless://` |
+| **A、B 在同一内网**（同一云厂商 VPC、WireGuard、Tailscale；见 8.4） | 完整节点 + 内网入口，或者纯内网出口 | B 上 `edge relay add` 打印的 `ss://`（内网链接） |
+| **B 是第三方节点、买来的代理**（见 8.5） | 不归本项目管 | 对方给的链接 |
+
+一台 B 可以同时服务多台 A，也可以同时是完整节点（手机直连）和内网出口。一台机器也可以既是别人的上游、自己又有上游（A → B → C），各自配置互不影响。
+
+### 8.3 场景一：A、B 都用本项目，走公网
+
+两台机器都按第 4 节正常安装成完整节点。然后：
+
+**第 1 步，在 B 上发通行证**（名字随意，建议用入口机的名字）：
+
+```bash
+edge relay add A01
+```
+
+输出类似：
+
+```
+================ 通行证：A01 ================
+【公网上的入口机用这条】
+vless://2222bbbb-...@www.b-domain.com:443?encryption=none&flow=xtls-rprx-vision&security=reality&...#relay-A01
+
+到入口机上运行（链接两边要加单引号）：
+  edge upstream '<上面的链接>'
+================================================
+```
+
+**第 2 步，在 A 上粘贴链接**：
+
+```bash
+edge upstream 'vless://2222bbbb-...#relay-A01'
+```
+
+A 会依次：解析链接 → 临时起一个测试用的 Xray，经 B 访问外网，确认出口 IP 是 B 的（见 8.7 节）→ 测试通过才写入 `.env`、重新生成配置、重启 Xray。输出类似：
+
+```
+[+] 上游：vless + reality（raw）→ www.b-domain.com:443
+[+] 先测试一下（临时启动一个测试用的 Xray，不影响正在运行的服务）
+[+] 能连上上游 www.b-domain.com:443
+[+] 出口 IP：203.0.113.20（本机：198.51.100.10），流量确实从上游出去
+...
+[+] 已启用上游：本机的代理流量全部经 www.b-domain.com:443 出去，本机不再直连任何网站
+```
+
+完成。手机上的配置不用改，照常连 A。
+
+> 链接里有 `&`、`#` 等字符，命令行里**一定要用单引号括起来**，否则会被 shell 截断。用菜单（`edge chain` → 1）粘贴就不用管引号。
+
+### 8.4 场景二：A、B 在同一内网
+
+前提：A 和 B 在同一个内网里，互相能 `ping` 通对方的内网 IP。下面假设 B 的内网 IP 是 `10.0.0.2`，A 是 `10.0.0.3`。
+
+走内网的好处：延迟更低；很多云厂商的内网流量不计费、不占公网带宽；A 和 B 之间的代理流量不经过公网。
+
+#### B 是完整节点（手机也直连 B）
+
+**第 1 步，在 B 上开启内网入口**（只需要做一次）：
+
+```bash
+edge internal                      # 交互：列出本机的内网 IP 让你选，再填端口（默认 23456）
+edge internal 10.0.0.2:23456       # 或者直接指定
+```
+
+脚本会检查这个 IP 确实是内网地址、确实在本机网卡上，不是就拒绝（防止代理端口暴露到公网）。
+
+**第 2 步，在云厂商的安全组 / 防火墙里放行这个端口**：
+
+| 方向 | 协议 | 端口 | 来源 |
+|---|---|---|---|
+| 入站 | TCP 和 UDP | 23456 | A 的内网 IP（`10.0.0.3/32`），或者整个内网网段 |
+
+UDP 也要放行，否则经过 A 的 UDP 流量（QUIC、游戏、语音）过不去。
+
+**第 3 步，在 B 上发通行证**：
+
+```bash
+edge relay add A01
+```
+
+开了内网入口后，每张通行证会打印两条链接：
+
+```
+【和本机在同一内网的入口机用这条】走内网：更快，通常也不计公网流量
+ss://2022-blake3-aes-128-gcm:...@10.0.0.2:23456#relay-A01
+
+【公网上的入口机用这条】
+vless://...@www.b-domain.com:443?...#relay-A01
+```
+
+**第 4 步，在 A 上用内网那条**：
+
+```bash
+edge upstream 'ss://2022-blake3-aes-128-gcm:...@10.0.0.2:23456#relay-A01'
+```
+
+已经发过的通行证在开启内网入口后也自动有了内网链接，`edge relay show <名字>` 重新显示即可，不用重新发。
+
+#### B 是纯内网出口（不需要域名，不对公网提供任何服务）
+
+适合 B 只当出口、不想买域名或不想暴露任何服务的情况。B 上不装 nginx、证书、伪装站，只跑一个 Xray。
+
+**安装 B**：上传项目后运行 `bash edge.sh`，第一个问题选 `2) 纯内网出口`，然后从列出的内网 IP 里选一个、填端口。装完会问是否马上发一张通行证。
+
+想跳过问答：先写好 `.env` 再运行 `bash edge.sh install`：
+
+```bash
+EDGE_ROLE=exit
+EXIT_LISTEN=10.0.0.2:23456
+```
+
+之后和上面一样：放行安全组 → `edge relay add A01`（只打印内网链接）→ 在 A 上 `edge upstream 'ss://...'`。
+
+纯内网出口的安全组**入站只需要 SSH**（加上对内网放行的入口端口），443 也不用开。
+
+### 8.5 场景三：上游是第三方节点或代理
+
+直接把对方给的链接交给 `edge upstream`：
+
+```bash
+edge upstream 'vless://...'
+edge upstream 'ss://...'
+edge upstream 'socks5://用户名:密码@1.2.3.4:1080'
+edge upstream 'http://用户名:密码@1.2.3.4:3128'
+edge upstream 'https://用户名:密码@proxy.example.com:443'
+```
+
+支持的链接：
+
+| 链接 | 支持的写法 | 说明 |
+|---|---|---|
+| `vless://` | `security=reality / tls / none`；`type=tcp(raw) / ws / grpc / xhttp / httpupgrade` | 不支持 `headerType=http` |
+| `ss://` | SIP002 base64 写法、SIP022 明文写法、老式整段 base64 | 加密方式只支持 AEAD 和 2022 系列；不支持插件（`plugin=`） |
+| `socks5://`（也认 `socks://`） | 有无认证都行；用户名密码可以是百分号编码，也可以是 base64 | **明文**，见下 |
+| `http://` | 有无认证都行 | **明文**，只能走 TCP |
+| `https://` | 套了 TLS 的 HTTP 代理 | 加密，只能走 TCP |
+
+暂不支持 `trojan://`、`vmess://`。
+
+注意：
+
+- **http / socks5 不加密**：A 到上游这一段，用户名密码和访问的域名都是明文（网页内容大多是 HTTPS，仍然加密）。上游不在内网时脚本会提醒。能用 `https://` 就别用 `http://`
+- **UDP**：http / https 代理不支持 UDP；socks5 要看上游有没有开 UDP（很多住宅代理不开）。UDP 不通时，浏览器的 QUIC 会自动退回 TCP，基本不影响上网，但游戏、语音通话这类只走 UDP 的应用用不了
+- **DNS 不会从 A 泄露**：A 交给上游的是域名本身，由上游解析
+- 拦截 BT、内网地址这些规则由对方负责；对方不拦 BT 的话，版权投诉会发到对方机器的商家
+
+### 8.6 命令详解
+
+所有操作都可以在菜单里完成：`edge` → `12) 链式代理`（内网出口模式是 `2)`），或者直接 `edge chain`。菜单顶部会显示本机的角色、出口、内网入口和通行证数量。
+
+#### `edge upstream` —— 在入口机（A）上操作
+
+| 命令 | 作用 |
+|---|---|
+| `edge upstream` | 查看当前上游：协议、地址、打码后的链接；没设置时提示怎么设置 |
+| `edge upstream '<链接>'` | 设置或更换上游：解析 → 测试 → 通过后写入 `.env` 并生效 |
+| `edge upstream '<链接>' --force` | 测试不通过也启用（比如上游暂时挂了，但你确定链接是对的）。在终端里运行时不加 `--force` 也会问你要不要继续 |
+| `edge upstream test` | 只测试当前上游，不改任何配置（8.7 节） |
+| `edge upstream off` | 取消上游，恢复直接出网 |
+
+细节：
+
+- 链接保存在 `.env` 的 `UPSTREAM='...'`（权限 600，不进 git），不会写进模板
+- 生效失败（比如 Xray 配置检查不通过）会自动恢复原来的设置，正在运行的服务不受影响
+- 不能把本机自己的链接设成上游
+- 设置了上游以后，生成的 Xray 配置只有一个出口 `upstream`，没有 `direct`（freedom），也没有分流规则：就算以后配置写错，A 也不会从本机直连出网
+
+#### `edge relay` —— 在出口机（B）上操作
+
+| 命令 | 作用 |
+|---|---|
+| `edge relay add <名字>` | 发一张通行证，打印链接。名字只能用字母、数字、`-`、`_`，最长 32 个字符，不能重复 |
+| `edge relay list` | 列出已发的通行证和发放日期（不显示链接） |
+| `edge relay show <名字>` | 再次显示某张通行证的链接（忘了链接、开了内网入口、轮换密钥之后用） |
+| `edge relay remove <名字>` | 吊销：用它的入口机立刻连不上，你的手机和其他通行证不受影响。不带名字时列出来让你选 |
+
+细节：
+
+- 通行证记在 `xray/relays.env`，一行一张：`名字 UUID SS密钥 发放日期`。不要手动改格式
+- 发放 / 吊销都会重新生成配置并重启 Xray，正在使用的连接会断开几秒后自动重连
+- B 是完整节点时，每张通行证都有公网链接（`vless://`，和手机走同一个 443 入口，只是 UUID 不同）；开了内网入口时再加一条内网链接（`ss://`）
+- 通行证就是一个独立用户，公网链接也能直接导入手机客户端，可以用来给别的设备单独发链接
+- Xray 日志里，通行证的流量显示为 `relay-<名字>@edge`，手机的是 `default@edge`
+
+#### `edge internal` —— 在出口机（B）上操作
+
+| 命令 | 作用 |
+|---|---|
+| `edge internal` | 查看内网入口；在终端里运行时会问要不要开启 / 修改 |
+| `edge internal set` | 直接进入交互设置：列出本机的内网 IP 供选择，再填端口 |
+| `edge internal <内网IP:端口>` | 开启或修改，例如 `edge internal 10.0.0.2:23456` |
+| `edge internal off` | 关闭内网入口：通行证的内网链接失效，公网链接不受影响。纯内网出口模式不能关闭 |
+
+细节：
+
+- 只接受内网地址：`10.x`、`172.16-31.x`、`192.168.x`、`100.64-127.x`（Tailscale 用这一段），并且必须是本机网卡上的 IP；不接受 `0.0.0.0` 和公网 IP
+- 目前只支持 IPv4
+- 端口不能用 443 / 8443 / 10443 和伪装站端口
+- **一张通行证都没有时，内网入口不监听**：Shadowsocks 2022 在没有用户时会退化成单用户模式，只凭服务端密钥就能连，而被吊销的入口机手里正好有这个密钥。发出第一张通行证后自动开始监听
+- 地址保存在 `.env` 的 `EXIT_LISTEN`；改了内网入口的 IP 或端口后，已发出的内网链接都要重新导入（`edge relay show <名字>`）
+
+### 8.7 验证：流量真的从上游出去了吗
+
+`edge upstream '<链接>'`、`edge upstream test` 和 `edge check` 都会做这个测试：
+
+1. 用 TCP 连一下上游的地址和端口，确认网络是通的
+2. 临时启动一个测试用的 Xray 容器（只监听 `127.0.0.1` 的随机端口，出口就是这个上游），**不影响正在运行的 xray**
+3. 分别直接访问、经测试容器访问 `https://www.cloudflare.com/cdn-cgi/trace`，取出返回的 IP
+4. 经上游拿到的 IP 和本机的不一样，才算通过
+
+```
+[+] 能连上上游 10.0.0.2:23456
+[+] 出口 IP：203.0.113.20（本机：198.51.100.10），流量确实从上游出去
+```
+
+测完测试容器自动删除。
+
+### 8.8 生成的配置长什么样
+
+想看实际配置运行 `edge xray`（密码打码）或 `edge xray --raw`。下面是示意。
+
+**B（完整节点 + 内网入口，发了一张通行证 A01）**：两个入口共用同一套出口和拦截规则
+
+```json
+"inbounds": [
+  {
+    "tag": "vless-reality", "listen": "127.0.0.1", "port": 10443, "protocol": "vless",
+    "settings": { "clients": [
+      { "id": "<主 UUID>",  "flow": "xtls-rprx-vision", "email": "default@edge" },
+      { "id": "<A01 UUID>", "flow": "xtls-rprx-vision", "email": "relay-A01@edge" }
+    ] },
+    ...REALITY 设置和现在一样...
+  },
+  {
+    "tag": "internal", "listen": "10.0.0.2", "port": 23456, "protocol": "shadowsocks",
+    "settings": {
+      "network": "tcp,udp", "method": "2022-blake3-aes-128-gcm", "password": "<服务端密钥>",
+      "clients": [ { "password": "<A01 密钥>", "email": "relay-A01@edge" } ]
+    }
+  }
+],
+"outbounds": [ direct（freedom）, block（blackhole） ],
+"routing":   { 拦截 geoip:private、拦截 bittorrent }
+```
+
+**A（设置了上游）**：入口和以前一样，出口只有一个，没有分流规则
+
+```json
+"outbounds": [
+  {
+    "tag": "upstream", "protocol": "shadowsocks",
+    "settings": { "servers": [ {
+      "address": "10.0.0.2", "port": 23456,
+      "method": "2022-blake3-aes-128-gcm", "password": "<服务端密钥>:<A01 密钥>"
+    } ] }
+  }
+]
+```
+
+各部分的模板在 `templates/xray/` 下（见第 2 节目录结构）。想加自定义分流规则，改 `templates/xray/egress-direct.json.tpl`，然后 `edge apply`。
+
+### 8.9 安全建议
+
+- **一台入口机一张通行证**：某台入口机被攻破或链接泄露，只吊销它那一张，不用轮换 B 的主密钥，手机也不用重新导入
+- **链接就是密码**：只发给对应的入口机，不要贴到公开的地方
+- **内网入口只对内网放行**：脚本保证 Xray 只监听内网 IP；安全组再限制来源为入口机的内网 IP，多一层保险
+- **轮换密钥（`edge rotate-keys`）会让所有通行证的链接失效**（REALITY 公钥和内网入口的服务端密钥都换了），轮换后在 B 上 `edge relay show <名字>`，再到每台入口机上重新 `edge upstream`
+- **http / socks5 上游是明文**，走公网时尽量换成 `https://` 或加密协议
+- 出口机不在你手里（第三方）时，它能看到你访问了哪些域名；HTTPS 网页的内容它看不到
+
+### 8.10 常见问题
+
+| 现象 | 排查 |
+|---|---|
+| 测试提示"连不上上游" | B 的 Xray 没在运行（在 B 上 `edge check`）；地址或端口不对；B 的安全组 / 防火墙没放行（内网入口要放行 TCP 和 UDP，来源包含 A 的内网 IP） |
+| 测试提示"经上游访问外网失败" | 链接不对或已失效：通行证被吊销、B 轮换过密钥、内网入口的 IP / 端口改过。在 B 上 `edge relay show <名字>` 拿最新链接；也可能是 B 自己出不了网 |
+| 测试提示"出口 IP 和本机一样" | 上游其实就是本机，或者上游又把流量转回了本机 |
+| 内网入口没有监听 | 还没发过通行证（没有通行证时故意不监听，见 8.6 节）；或者 `EXIT_LISTEN` 的 IP 不在本机网卡上（`ip -4 addr` 查看，WireGuard / Tailscale 的网卡要先起来） |
+| A 设置上游后手机上不了网 | B 挂了或链接失效。先在 A 上 `edge upstream test` 看原因；急用时 `edge upstream off` 立刻恢复直接出网 |
+| 经 A 打游戏、语音通话不通，网页正常 | UDP 不通：上游是 http / https 代理（不支持 UDP），或 socks5 上游没开 UDP，或内网入口的安全组没放行 UDP |
+| `edge relay add` 提示名字已存在 | 换个名字，或 `edge relay show <名字>` 显示原来那张的链接 |
+| 手动改了 `.env` 的 `UPSTREAM` 后 `edge apply` 报错 | 链接两边要加单引号：`UPSTREAM='vless://...'`。推荐用 `edge upstream '<链接>'` 设置 |
+
+---
+
+## 9. 日常运维
 
 日常操作直接运行 `edge` 打开菜单即可，下面是对应的命令和少数菜单外的操作：
 
@@ -280,13 +605,13 @@ Token 被删除或权限被修改都会导致续期失败；`edge check` 会在�
 | 轮换 Xray 密钥 | `edge rotate-keys` |
 | 手动测试日志轮转 | `logrotate -f /etc/logrotate.d/edge-nginx` |
 
-**增加 Xray 用户**：在 `templates/xray-config.json.tpl` 的 `clients` 里加一项（新 UUID 可以用 `cat /proc/sys/kernel/random/uuid` 生成，`email` 填不同的值），然后执行 `edge apply`。
+**增加 Xray 用户**：运行 `edge relay add <名字>`。通行证本质上就是一个独立的用户，打印出来的公网链接（`vless://`）可以导入任何客户端，比如发给另一台手机或家人用，不用了 `edge relay remove <名字>` 单独吊销。用户列表由脚本生成，不要再手动改模板里的 `clients`。
 
-**备份**：`/opt/edge`（可以排除 `logs/`）加上 `/root/.acme.sh/`。换机器时拷到同样的路径，再运行 `bash /opt/edge/edge.sh install` 即可（密钥、证书、站点都会复用，`apps/` 下已发布的应用会按原来的端口自动构建、启动）。应用自己的数据如果用了 Docker 卷，要单独备份。
+**备份**：`/opt/edge`（可以排除 `logs/`）加上 `/root/.acme.sh/`。`xray/keys.env` 和 `xray/relays.env` 都在里面，恢复后已发出的通行证继续有效。换机器时拷到同样的路径，再运行 `bash /opt/edge/edge.sh install` 即可（密钥、证书、站点都会复用，`apps/` 下已发布的应用会按原来的端口自动构建、启动）。应用自己的数据如果用了 Docker 卷，要单独备份。
 
 ---
 
-## 9. 常见问题
+## 10. 常见问题
 
 | 现象 | 排查 |
 |---|---|
@@ -300,12 +625,15 @@ Token 被删除或权限被修改都会导致续期失败；`edge check` 会在�
 | 后端 502 | 后端容器没起来，或者端口没有绑定在 `127.0.0.1:<端口>` |
 | 签发失败 | Token 权限、Zone Resources 是否包含该域名；`tail ~/.acme.sh/acme.sh.log` |
 
+链式代理相关的问题见 8.10 节。
+
 ---
 
-## 10. 安全注意事项
+## 11. 安全注意事项
 
 - 业务容器的端口**必须**写成 `127.0.0.1:端口:容器端口`：即使安全组以后配错，业务端口也不会绕过 nginx 直接暴露在公网。`edge check` 会列出所有对外监听的端口，方便和安全组规则对照
-- Xray 配置里屏蔽了 `geoip:private`，防止通过代理访问本机的 127.0.0.1 服务，不要删除
-- `.env`、`xray/keys.env`、`xray/config.json`、`certs/*/key.pem` 都是敏感文件（权限 600）
+- Xray 配置里屏蔽了 `geoip:private`，防止通过代理访问本机的 127.0.0.1 服务，不要删除。设置了上游的入口机不做任何分流，这条规则由真正出网的上游负责（见 8.1 节）
+- `.env`、`xray/keys.env`、`xray/relays.env`、`xray/config.json`、`certs/*/key.pem` 都是敏感文件（权限 600）
+- 链式代理的安全要点（通行证、内网入口、明文上游）见 8.9 节
 - 伪装站要像一个真实网站：`apps/decoy/` 里放有正常内容的页面
 - 不开 80 端口：现代浏览器默认优先尝试 https，访问过一次后 HSTS 会让浏览器一直走 https；只有极少数手动输入 `http://` 的首次访问会连不上

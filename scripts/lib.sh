@@ -26,8 +26,20 @@ load_env() {
     # shellcheck disable=SC1090
     . <(sed 's/\r$//' "$EDGE_DIR/.env")
     set +a
-    : "${REALITY_SNI:?.env 缺少 REALITY_SNI}"
-    : "${REALITY_CERT_DOMAIN:?.env 缺少 REALITY_CERT_DOMAIN}"
+    # 本机角色：edge = 完整节点（默认，旧版 .env 没有这一项）；exit = 只做内网出口
+    EDGE_ROLE="${EDGE_ROLE:-edge}"
+    case "$EDGE_ROLE" in
+        edge|exit) ;;
+        *) die ".env 里 EDGE_ROLE=$EDGE_ROLE 不对：填 edge（完整节点）或 exit（只做内网出口）" ;;
+    esac
+    if [ "$EDGE_ROLE" = edge ]; then
+        : "${REALITY_SNI:?.env 缺少 REALITY_SNI}"
+        : "${REALITY_CERT_DOMAIN:?.env 缺少 REALITY_CERT_DOMAIN}"
+    fi
+    REALITY_SNI="${REALITY_SNI:-}"
+    REALITY_CERT_DOMAIN="${REALITY_CERT_DOMAIN:-}"
+    UPSTREAM="${UPSTREAM:-}"
+    EXIT_LISTEN="${EXIT_LISTEN:-}"
     NODE_NAME="${NODE_NAME:-edge-reality}"
     # 伪装站端口；兼容旧版 .env 里的 DECOY_UPSTREAM（3000 或 127.0.0.1:3000）
     DECOY_PORT="${DECOY_PORT:-${DECOY_UPSTREAM:-}}"
@@ -45,10 +57,10 @@ load_keys() {
     . <(sed 's/\r$//' "$KEYS_FILE")
 }
 
-# render <模板> <输出文件> <变量名...>：把模板里的 __变量名__ 替换为变量值
-render() {
-    local tpl="$1" out="$2" content v
-    shift 2
+# render_text <模板> <变量名...>：把模板里的 __变量名__ 替换为变量值，输出结果
+render_text() {
+    local tpl="$1" content v
+    shift
     content="$(<"$tpl")"
     for v in "$@"; do
         content="${content//"__${v}__"/"${!v}"}"
@@ -56,6 +68,14 @@ render() {
     if grep -qE '__[A-Z0-9_]+__' <<<"$content"; then
         die "渲染 $tpl 后仍有未替换的占位符：$(grep -oE '__[A-Z0-9_]+__' <<<"$content" | sort -u | tr '\n' ' ')"
     fi
+    printf '%s\n' "$content"
+}
+
+# render <模板> <输出文件> <变量名...>：同上，写入文件
+render() {
+    local tpl="$1" out="$2" content
+    shift 2
+    content="$(render_text "$tpl" "$@")"
     # 用重定向覆盖写入（保持 inode 不变，对容器的单文件挂载友好）
     printf '%s\n' "$content" >"$out"
 }
@@ -174,4 +194,411 @@ alloc_port() {  # 从 3001 开始找一个没被站点配置、伪装站、本�
 
 nginx_running() {
     docker ps --format '{{.Names}}' 2>/dev/null | grep -qx nginx
+}
+
+xray_exists() {  # xray 容器存在（不管是否在运行）
+    docker ps -a --format '{{.Names}}' 2>/dev/null | grep -qx xray
+}
+
+# ================================================================ 链式代理
+# 术语：
+#   上游（UPSTREAM）  本机把代理流量全部转给它，由它出网；本机不直连任何目标网站
+#   通行证（relay）   本机发给别的机器（入口机）的独立凭据，入口机拿它把本机当上游
+#   内网入口          给同一内网里的入口机用的 Shadowsocks 2022 入口，只监听内网 IP
+RELAYS_FILE="$EDGE_DIR/xray/relays.env"
+RELAY_NAME_RE='^[A-Za-z0-9_-]{1,32}$'
+SS_METHOD="2022-blake3-aes-128-gcm"
+# 测出口 IP 用：Cloudflare 的 trace 页面，返回内容里有一行 ip=<访问者 IP>
+TRACE_URL="https://www.cloudflare.com/cdn-cgi/trace"
+
+# urlencode <文本>：按 UTF-8 字节做百分号编码（中文、空格、emoji 都可以放进分享链接）
+urlencode() {
+    local b c out=""
+    for b in $(printf '%s' "$1" | od -An -v -tx1); do
+        case "$b" in
+            3[0-9]|4[1-9a-f]|5[0-9a]|6[1-9a-f]|7[0-9a]|2d|2e|5f|7e)
+                printf -v c "\\x$b"; out+="$c" ;;       # 字母、数字、- . _ ~ 原样保留
+            *)  out+="%${b^^}" ;;
+        esac
+    done
+    printf '%s' "$out"
+}
+
+urldecode() {  # urldecode <文本>：解开 %XX
+    local s="${1//\\/\\\\}"
+    printf '%b' "${s//%/\\x}"
+}
+
+b64dec() {  # b64dec <文本>：base64 / base64url 解码，自动补齐 =
+    local s="${1//-/+}"
+    s="${s//_//}"
+    case $(( ${#s} % 4 )) in
+        2) s+="==" ;;
+        3) s+="=" ;;
+    esac
+    printf '%s' "$s" | base64 -d 2>/dev/null
+}
+
+json_str() {  # json_str <文本>：输出 JSON 字符串（带引号），去掉控制字符
+    local s="${1//[[:cntrl:]]/}"
+    s="${s//\\/\\\\}"
+    s="${s//\"/\\\"}"
+    printf '"%s"' "$s"
+}
+
+# UUID v4：优先读内核，否则用 openssl 随机数拼出来
+gen_uuid() {
+    if [ -r /proc/sys/kernel/random/uuid ]; then
+        cat /proc/sys/kernel/random/uuid
+        return
+    fi
+    local h
+    h="$(openssl rand -hex 16)"
+    printf '%s-%s-4%s-%x%s-%s\n' "${h:0:8}" "${h:8:4}" "${h:13:3}" \
+        $(( (0x${h:16:1} & 3) | 8 )) "${h:17:3}" "${h:20:12}"
+}
+
+gen_ss_key() { openssl rand -base64 16; }   # Shadowsocks 2022（aes-128-gcm）密钥：16 字节
+
+# is_private_ipv4 <IP>：10.x / 172.16-31.x / 192.168.x / 100.64-127.x（CGNAT，Tailscale 用这段）
+is_private_ipv4() {
+    local a b c d
+    [[ "$1" =~ ^([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})$ ]] || return 1
+    a=$((10#${BASH_REMATCH[1]})) b=$((10#${BASH_REMATCH[2]})) c=$((10#${BASH_REMATCH[3]})) d=$((10#${BASH_REMATCH[4]}))
+    [ "$a" -le 255 ] && [ "$b" -le 255 ] && [ "$c" -le 255 ] && [ "$d" -le 255 ] || return 1
+    [ "$a" -eq 10 ] && return 0
+    [ "$a" -eq 172 ] && [ "$b" -ge 16 ] && [ "$b" -le 31 ] && return 0
+    [ "$a" -eq 192 ] && [ "$b" -eq 168 ] && return 0
+    [ "$a" -eq 100 ] && [ "$b" -ge 64 ] && [ "$b" -le 127 ] && return 0
+    return 1
+}
+
+# local_private_ips：本机网卡上的内网 IPv4，每行 "IP 网卡名"
+local_private_ips() {
+    local ip dev
+    command -v ip >/dev/null || return 0
+    while read -r ip dev; do
+        if is_private_ipv4 "$ip"; then echo "$ip $dev"; fi
+    done < <(ip -4 -o addr show scope global 2>/dev/null | awk '{split($4, a, "/"); print a[1], $2}')
+}
+
+# exit_listen_check <IP:端口>：内网入口地址能不能用；能用时设置 EXIT_IP / EXIT_PORT，不能用时打印原因、返回 1
+exit_listen_check() {
+    local v="$1"
+    if ! [[ "$v" =~ ^([0-9.]+):([0-9]+)$ ]]; then
+        warn "内网入口地址格式不对：${v:-（空）}（应为 内网IP:端口，例如 10.0.0.2:23456）"
+        return 1
+    fi
+    EXIT_IP="${BASH_REMATCH[1]}" EXIT_PORT="${BASH_REMATCH[2]}"
+    if ! is_private_ipv4 "$EXIT_IP"; then
+        warn "$EXIT_IP 不是内网地址：内网入口只能监听 10.x / 172.16-31.x / 192.168.x / 100.64-127.x，防止代理端口暴露到公网"
+        return 1
+    fi
+    if ! port_ok "$EXIT_PORT" || [ "$EXIT_PORT" = "${DECOY_PORT:-}" ]; then
+        warn "端口 $EXIT_PORT 不能用：填 1-65535，不能用 443 / 8443 / 10443 和伪装站端口"
+        return 1
+    fi
+    if command -v ip >/dev/null && ! ip -4 -o addr show 2>/dev/null | grep -qF " inet $EXIT_IP/"; then
+        warn "本机网卡上没有 $EXIT_IP：确认这是本机的内网 IP（ip -4 addr 查看）"
+        return 1
+    fi
+}
+
+# ---------------------------------------------------------------- 通行证（xray/relays.env）
+# 每行一张：名字 UUID SS密钥 发放日期
+#   UUID   用于公网入口（VLESS + REALITY）
+#   SS密钥 用于内网入口（Shadowsocks 2022 多用户）
+relays_load() {  # 读到数组 RELAY_NAMES / RELAY_UUIDS / RELAY_SSKEYS / RELAY_DATES
+    local n u k d
+    RELAY_NAMES=() RELAY_UUIDS=() RELAY_SSKEYS=() RELAY_DATES=()
+    [ -f "$RELAYS_FILE" ] || return 0
+    while read -r n u k d; do
+        if [ -z "$n" ] || [[ "$n" == \#* ]]; then continue; fi
+        [[ "$n" =~ $RELAY_NAME_RE && "$u" =~ ^[0-9a-fA-F-]{36}$ && "$k" =~ ^[A-Za-z0-9+/=]{24}$ ]] \
+            || die "$RELAYS_FILE 里这一行格式不对：$n（应为：名字 UUID SS密钥 日期）"
+        RELAY_NAMES+=("$n") RELAY_UUIDS+=("$u") RELAY_SSKEYS+=("$k") RELAY_DATES+=("${d:--}")
+    done < <(sed 's/\r$//' "$RELAYS_FILE")
+}
+
+relay_index() {  # relay_index <名字>：输出它在数组里的下标；没有返回 1（先 relays_load）
+    local i
+    for i in "${!RELAY_NAMES[@]}"; do
+        if [ "${RELAY_NAMES[$i]}" = "$1" ]; then echo "$i"; return 0; fi
+    done
+    return 1
+}
+
+# ---------------------------------------------------------------- 分享链接
+# vless_link <UUID> <节点名>：本机公网入口（REALITY）的分享链接（需要 load_keys）
+vless_link() {
+    printf 'vless://%s@%s:443?encryption=none&flow=xtls-rprx-vision&security=reality&sni=%s&fp=chrome&pbk=%s&sid=%s&type=tcp&headerType=none#%s' \
+        "$1" "$REALITY_SNI" "$REALITY_SNI" "$XRAY_PUBLIC_KEY" "$XRAY_SHORT_ID" "$(urlencode "$2")"
+}
+
+# ss_link <SS用户密钥> <节点名>：本机内网入口的分享链接（需要 load_keys 和 exit_listen_check）
+# Shadowsocks 2022 多用户：客户端密码是 "服务端密钥:用户密钥"；按 SIP022 用百分号编码的明文
+ss_link() {
+    printf 'ss://%s:%s@%s:%s#%s' "$SS_METHOD" "$(urlencode "$SS_SERVER_KEY:$1")" \
+        "$EXIT_IP" "$EXIT_PORT" "$(urlencode "$2")"
+}
+
+# ---------------------------------------------------------------- 上游链接解析
+_qp() {  # _qp <查询串> <参数名>：取查询参数（已解码），没有输出空
+    local kv parts
+    IFS='&' read -ra parts <<<"$1"
+    for kv in "${parts[@]}"; do
+        if [ "${kv%%=*}" = "$2" ]; then urldecode "${kv#*=}"; return 0; fi
+    done
+}
+
+_hostport() {  # _hostport <host:port>：设置 UP_HOST / UP_PORT / UP_ADDR（IPv6 写成 [::1]:443）
+    if [[ "$1" =~ ^\[([0-9A-Fa-f:.]+)\]:([0-9]{1,5})$ ]] || [[ "$1" =~ ^([A-Za-z0-9.-]+):([0-9]{1,5})$ ]]; then
+        UP_HOST="${BASH_REMATCH[1]}" UP_PORT="$((10#${BASH_REMATCH[2]}))" UP_ADDR="$1"
+        [ "$UP_PORT" -ge 1 ] && [ "$UP_PORT" -le 65535 ] && return 0
+    fi
+    warn "链接里的地址不对：${1:-（空）}（应为 主机:端口）"
+    return 1
+}
+
+_userpass() {  # _userpass <userinfo>：设置 UP_USER / UP_PASS；支持 user:pass（百分号编码）和 base64(user:pass)
+    local ui
+    UP_USER="" UP_PASS=""
+    [ -n "$1" ] || return 0
+    ui="$(urldecode "$1")"
+    [[ "$ui" == *:* ]] || ui="$(b64dec "$1")"
+    [[ "$ui" == *:* ]] || { warn "链接里的用户名密码看不懂（应为 用户名:密码）"; return 1; }
+    UP_USER="${ui%%:*}" UP_PASS="${ui#*:}"
+}
+
+_plain_warn() {  # 明文协议、上游又不在内网：提醒
+    if ! is_private_ipv4 "$UP_HOST"; then
+        UP_WARN="$1 不加密：本机到上游这一段，密码和访问的域名都是明文（网页内容大多是 HTTPS，仍然是加密的）"
+    fi
+}
+
+_json_list() {  # _json_list <逗号分隔的值>：输出 JSON 数组的内容 "a", "b"
+    local a out="" parts
+    IFS=',' read -ra parts <<<"$1"
+    for a in "${parts[@]}"; do out+="${out:+, }$(json_str "$a")"; done
+    printf '%s' "$out"
+}
+
+# upstream_parse <链接>：解析上游链接。成功时设置：
+#   UP_OUTBOUND  Xray 出口配置（JSON，tag 为 upstream）
+#   UP_HOST / UP_PORT 上游地址；UP_DESC 简介（不含密码）；UP_WARN 需要提醒的事（可能为空）
+# 支持：vless://（reality / tls / none；raw、ws、grpc、xhttp、httpupgrade）、ss://、socks5://、http://、https://
+# 看不懂时打印原因、返回 1
+upstream_parse() {
+    local link="$1" scheme rest query userinfo hostport
+    local id enc flow sec net sni fp pbk sid spx pqv alpn host path svc mode users stream tls trans ui method pw dec
+    UP_OUTBOUND="" UP_HOST="" UP_PORT="" UP_DESC="" UP_WARN=""
+
+    if [ -z "$link" ]; then warn "上游链接为空"; return 1; fi
+    if [[ "$link" =~ [[:space:][:cntrl:]] || "$link" == *[\'\"\\\`]* ]]; then
+        warn "上游链接里不能有空格、引号、反斜杠：确认复制完整，没有多余字符"
+        return 1
+    fi
+    if [[ "$link" != *://* ]]; then warn "看不懂这个链接：应以 vless:// ss:// socks5:// http:// https:// 开头"; return 1; fi
+    scheme="${link%%://*}"
+    scheme="${scheme,,}"
+    rest="${link#*://}"
+    rest="${rest%%#*}"                       # 去掉 #节点名
+    query=""
+    if [[ "$rest" == *\?* ]]; then query="${rest#*\?}"; rest="${rest%%\?*}"; fi
+    rest="${rest%/}"
+    if [[ "$rest" == *@* ]]; then userinfo="${rest%@*}" hostport="${rest##*@}"; else userinfo="" hostport="$rest"; fi
+
+    case "$scheme" in
+    vless)
+        _hostport "$hostport" || return 1
+        id="$(urldecode "$userinfo")"
+        [[ "$id" =~ ^[A-Za-z0-9_-]{1,64}$ ]] || { warn "vless 链接里的 UUID 不对：${id:-（空）}"; return 1; }
+        enc="$(_qp "$query" encryption)"; enc="${enc:-none}"
+        flow="$(_qp "$query" flow)"
+        sec="$(_qp "$query" security)"; sec="${sec:-none}"
+        net="$(_qp "$query" type)"; net="${net:-raw}"; [ "$net" != tcp ] || net=raw
+        sni="$(_qp "$query" sni)"; fp="$(_qp "$query" fp)"
+        host="$(_qp "$query" host)"; path="$(_qp "$query" path)"
+
+        users="{ \"id\": $(json_str "$id"), \"encryption\": $(json_str "$enc")"
+        [ -z "$flow" ] || users+=", \"flow\": $(json_str "$flow")"
+        users+=" }"
+
+        case "$sec" in
+        reality)
+            pbk="$(_qp "$query" pbk)"; sid="$(_qp "$query" sid)"; spx="$(_qp "$query" spx)"; pqv="$(_qp "$query" pqv)"
+            [ -n "$pbk" ] || { warn "REALITY 链接缺少公钥（pbk）"; return 1; }
+            [ -n "$sni" ] || { warn "REALITY 链接缺少 sni"; return 1; }
+            tls="\"realitySettings\": { \"serverName\": $(json_str "$sni"), \"fingerprint\": $(json_str "${fp:-chrome}"), \"publicKey\": $(json_str "$pbk"), \"shortId\": $(json_str "$sid")"
+            [ -z "$spx" ] || tls+=", \"spiderX\": $(json_str "$spx")"
+            [ -z "$pqv" ] || tls+=", \"mldsa65Verify\": $(json_str "$pqv")"
+            tls+=" }"
+            ;;
+        tls)
+            alpn="$(_qp "$query" alpn)"
+            tls="\"tlsSettings\": { \"serverName\": $(json_str "${sni:-${host:-$UP_HOST}}")"
+            [ -z "$fp" ] || tls+=", \"fingerprint\": $(json_str "$fp")"
+            [ -z "$alpn" ] || tls+=", \"alpn\": [ $(_json_list "$alpn") ]"
+            tls+=" }"
+            ;;
+        none)
+            tls=""
+            if ! is_private_ipv4 "$UP_HOST"; then UP_WARN="这条 vless 链接没有加密（security=none）：本机到上游这一段是明文"; fi
+            ;;
+        *) warn "不支持的 security=$sec（支持 reality / tls / none）"; return 1 ;;
+        esac
+
+        case "$net" in
+        raw)
+            if [ "$(_qp "$query" headerType)" = http ]; then warn "不支持 tcp + http 伪装（headerType=http）"; return 1; fi
+            trans="" ;;
+        ws)          trans="\"wsSettings\": { \"path\": $(json_str "${path:-/}")${host:+, \"host\": $(json_str "$host")} }" ;;
+        httpupgrade) trans="\"httpupgradeSettings\": { \"path\": $(json_str "${path:-/}")${host:+, \"host\": $(json_str "$host")} }" ;;
+        grpc)
+            svc="$(_qp "$query" serviceName)"; mode="$(_qp "$query" mode)"
+            trans="\"grpcSettings\": { \"serviceName\": $(json_str "$svc")"
+            [ "$mode" != multi ] || trans+=", \"multiMode\": true"
+            trans+=" }" ;;
+        xhttp)
+            mode="$(_qp "$query" mode)"
+            trans="\"xhttpSettings\": { \"path\": $(json_str "${path:-/}")${host:+, \"host\": $(json_str "$host")}${mode:+, \"mode\": $(json_str "$mode")} }" ;;
+        *) warn "不支持的传输方式 type=$net（支持 tcp/raw、ws、grpc、xhttp、httpupgrade）"; return 1 ;;
+        esac
+
+        stream="\"network\": $(json_str "$net"), \"security\": $(json_str "$sec")"
+        [ -z "$tls" ] || stream+=", $tls"
+        [ -z "$trans" ] || stream+=", $trans"
+        UP_OUTBOUND="    {
+      \"tag\": \"upstream\",
+      \"protocol\": \"vless\",
+      \"settings\": {
+        \"vnext\": [ { \"address\": $(json_str "$UP_HOST"), \"port\": $UP_PORT, \"users\": [ $users ] } ]
+      },
+      \"streamSettings\": { $stream }
+    }"
+        UP_DESC="vless + $sec（$net）→ $UP_ADDR"
+        ;;
+
+    ss)
+        if [ -n "$(_qp "$query" plugin)" ]; then warn "不支持带插件（plugin）的 ss 链接"; return 1; fi
+        if [ -z "$userinfo" ]; then                  # 老格式：ss://base64(method:password@host:port)
+            dec="$(b64dec "$hostport")"
+            [[ "$dec" == *@* ]] || { warn "ss 链接看不懂"; return 1; }
+            ui="${dec%@*}" hostport="${dec##*@}"
+        else
+            ui="$(urldecode "$userinfo")"
+            [[ "$ui" == *:* ]] || ui="$(b64dec "$userinfo")"   # SIP002：base64url(method:password)
+        fi
+        [[ "$ui" == *:* ]] || { warn "ss 链接里的加密方式和密码看不懂"; return 1; }
+        method="${ui%%:*}" pw="${ui#*:}"
+        _hostport "$hostport" || return 1
+        case "$method" in
+            2022-blake3-aes-128-gcm|2022-blake3-aes-256-gcm|2022-blake3-chacha20-poly1305|\
+            aes-128-gcm|aes-256-gcm|chacha20-poly1305|chacha20-ietf-poly1305|xchacha20-poly1305|xchacha20-ietf-poly1305) ;;
+            *) warn "不支持的 ss 加密方式：$method"; return 1 ;;
+        esac
+        [ -n "$pw" ] || { warn "ss 链接里没有密码"; return 1; }
+        UP_OUTBOUND="    {
+      \"tag\": \"upstream\",
+      \"protocol\": \"shadowsocks\",
+      \"settings\": {
+        \"servers\": [ { \"address\": $(json_str "$UP_HOST"), \"port\": $UP_PORT, \"method\": $(json_str "$method"), \"password\": $(json_str "$pw") } ]
+      }
+    }"
+        UP_DESC="shadowsocks（$method）→ $UP_ADDR"
+        ;;
+
+    socks|socks5|socks5h|http|https)
+        _hostport "$hostport" || return 1
+        _userpass "$userinfo" || return 1
+        if [ -n "$UP_USER" ]; then
+            users=", \"users\": [ { \"user\": $(json_str "$UP_USER"), \"pass\": $(json_str "$UP_PASS") } ]"
+        else
+            users=""
+        fi
+        case "$scheme" in
+            socks*) method=socks; UP_DESC="socks5 → $UP_ADDR"; _plain_warn "socks5" ;;
+            http)   method=http;  UP_DESC="http → $UP_ADDR";   _plain_warn "http 代理" ;;
+            https)  method=http;  UP_DESC="https → $UP_ADDR" ;;
+        esac
+        [ -z "$UP_USER" ] || UP_DESC+="（有认证）"
+        stream=""
+        if [ "$scheme" = https ]; then
+            sni="$(_qp "$query" sni)"
+            stream=",
+      \"streamSettings\": { \"security\": \"tls\", \"tlsSettings\": { \"serverName\": $(json_str "${sni:-$UP_HOST}") } }"
+        fi
+        UP_OUTBOUND="    {
+      \"tag\": \"upstream\",
+      \"protocol\": \"$method\",
+      \"settings\": {
+        \"servers\": [ { \"address\": $(json_str "$UP_HOST"), \"port\": $UP_PORT$users } ]
+      }$stream
+    }"
+        ;;
+
+    *)
+        warn "不支持的链接类型 $scheme://（支持 vless ss socks5 http https）"
+        return 1 ;;
+    esac
+}
+
+# upstream_mask <链接>：给人看的链接，隐藏 UUID / 密码 / 公钥
+upstream_mask() {
+    local l="$1"
+    if [[ "$l" == *@* ]]; then l="${l%%://*}://******@${l##*@}"; fi
+    printf '%s' "$l" | sed -E 's/((pbk|sid|pqv)=)[^&#]*/\1******/g'
+}
+
+# upstream_probe <链接>：临时起一个 Xray 容器，经这个上游访问外网
+# 确认：能连上、能出网、出口 IP 不是本机。不影响正在运行的 xray。通过返回 0
+upstream_probe() {
+    local link="$1" dir name port i direct4="" direct6="" via="" rc=0 logs=""
+    upstream_parse "$link" || return 1
+
+    # shellcheck disable=SC2016
+    if timeout 5 bash -c 'exec 3<>"/dev/tcp/$0/$1"' "$UP_HOST" "$UP_PORT" 2>/dev/null; then
+        log "能连上上游 $UP_HOST:$UP_PORT"
+    else
+        warn "连不上上游 $UP_HOST:$UP_PORT：上游没启动、地址或端口写错，或者被对方的防火墙 / 安全组挡住了"
+        return 1
+    fi
+
+    port=$(( 20000 + RANDOM % 20000 ))
+    name="edge-uptest-$$"
+    dir="$(mktemp -d)"
+    printf '{\n  "log": { "loglevel": "warning" },\n  "inbounds": [ { "listen": "127.0.0.1", "port": %s, "protocol": "socks", "settings": { "udp": false } } ],\n  "outbounds": [\n%s\n  ]\n}\n' \
+        "$port" "$UP_OUTBOUND" >"$dir/config.json"
+    chown "0:$XRAY_UID" "$dir/config.json" 2>/dev/null || true
+    chmod 640 "$dir/config.json"
+    if ! docker run -d --rm --name "$name" --network host \
+            -v "$dir/config.json:/etc/xray/config.json:ro" \
+            "$XRAY_IMAGE" run -c /etc/xray/config.json >/dev/null 2>&1; then
+        rm -rf "$dir"
+        warn "测试用的 Xray 容器启动失败（docker run $XRAY_IMAGE）"
+        return 1
+    fi
+    for i in $(seq 1 20); do
+        if ss -tlnH 2>/dev/null | awk '{print $4}' | grep -qx "127.0.0.1:$port"; then break; fi
+        sleep 0.25
+    done
+
+    direct4="$(curl -4 -s --max-time 8 "$TRACE_URL" 2>/dev/null | sed -n 's/^ip=//p')" || true
+    direct6="$(curl -6 -s --max-time 8 "$TRACE_URL" 2>/dev/null | sed -n 's/^ip=//p')" || true
+    via="$(curl -s --max-time 15 --socks5-hostname "127.0.0.1:$port" "$TRACE_URL" 2>/dev/null | sed -n 's/^ip=//p')" || true
+    if [ -z "$via" ]; then logs="$(docker logs "$name" 2>&1 | tail -n 5)" || true; fi
+    docker rm -f "$name" >/dev/null 2>&1 || true
+    rm -rf "$dir"
+
+    if [ -z "$via" ]; then
+        warn "经上游访问外网失败：链接里的密码 / UUID / 公钥不对，或者上游自己出不了网"
+        if [ -n "$logs" ]; then printf '%s\n' "$logs" | sed 's/^/      xray: /' >&2; fi
+        rc=1
+    elif [ "$via" = "$direct4" ] || [ "$via" = "$direct6" ]; then
+        warn "出口 IP（$via）和本机一样：流量没有走上游"
+        rc=1
+    else
+        log "出口 IP：$via（本机：${direct4:-${direct6:-未知}}），流量确实从上游出去"
+    fi
+    return "$rc"
 }
