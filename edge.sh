@@ -103,15 +103,7 @@ env_set() {  # env_set KEY VALUE：改写 .env 里的 KEY=，没有就追加
 
 is_example() { case "$1" in ""|example.com|*.example.com) return 0 ;; esac; return 1; }
 
-# ---------------------------------------------------------------- Cloudflare
-# cf_zone_of <域名>：打印该域名所在的 Cloudflare 域名（zone），用 $CF_Token
-# 返回 0 找到；1 Token 有效但看不到这个域名；2 网络问题；3 Token 无效
-cf_zone_of() {
-    local d="$1" resp
-    # 直接调用 lib.sh 里的 cf_zone_of 实现，edge.sh 本身也可以弃用这个重复定义
-    # 为兼容，这里直接调用 lib.sh 的实现逻辑，这里不再重复定义以防污染
-    command -v cf_zone_of >/dev/null && command cf_zone_of "$1" || return 1
-}
+# cf_zone_of / cf_zone_lookup 定义在 scripts/lib.sh，这里不要重复定义（会覆盖掉 lib.sh 的实现）
 
 # pick_cert_domain <域名> [zone]：决定给这个域名签哪张泛域名证书（X + *.X）
 #   www.foo.com → foo.com；foo.com → foo.com；a.b.foo.com → b.foo.com
