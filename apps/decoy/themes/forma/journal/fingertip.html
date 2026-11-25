@@ -1,0 +1,52 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#fafaf8">
+  <meta name="description" content="FORMA 01 第三版指尖触觉阵列的设计取舍。">
+  <title>第三版指尖：把触觉做薄 · FORMA Robotics</title>
+  <link rel="icon" href="/assets/mark.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="/style.css">
+  <script src="/site.js" defer></script>
+</head>
+<body>
+  <a class="skip" href="#main">跳至正文</a>
+  <header class="mast">
+    <nav class="wrap nav" aria-label="主导航">
+      <a class="brand" href="/" aria-label="FORMA Robotics 首页"><img src="/assets/mark.svg" alt="" width="32" height="32"><span>FORMA</span><small>ROBOTICS</small></a>
+      <div class="nav-links"><a href="/">FORMA 01</a><a href="/journal" aria-current="page">设计日志</a><a href="/about">关于我们</a></div>
+    </nav>
+  </header>
+  <main id="main">
+    <article class="article">
+      <header class="article-head wrap-narrow">
+        <a class="back" href="/journal">设计日志</a>
+        <h1>第三版指尖：把触觉做薄</h1>
+        <p class="article-meta"><time datetime="2026-10-14">2026 年 10 月 14 日</time><span>许知行</span></p>
+      </header>
+      <figure class="article-figure wrap"><div class="frame"><img src="/assets/touch.jpg" width="1672" height="941" alt="第二代样机的手指捏住一颗直径 4 厘米的橙色小球"></div><figcaption>第二代样机的抓取测试，小球直径 4 厘米，重 18 克。</figcaption></figure>
+      <div class="prose wrap-narrow">
+        <p>指尖是 FORMA 01 上改动最频繁的部件。到今天为止，我们一共做了三代触觉阵列，前两代都比现在这版更“灵敏”，但最后都没有留下来。</p>
+        <h2>第一版：太厚</h2>
+        <p>第一版用的是现成的压阻薄膜，叠了三层保护材料之后，指尖整体厚了将近 4 毫米。数据很好看，但手指看起来像戴了一层手套，捏小物件时也明显笨拙，抓取一枚硬币的成功率不到六成。</p>
+        <h2>第二版：太娇气</h2>
+        <p>第二版改用电容式阵列，厚度降到 2 毫米，最小可感知的力也更小。问题出在寿命上：在连续抓放测试中，大约两万次之后边缘的感应单元开始漂移，需要重新标定。对一台要放在家里的机器来说，这不可接受。</p>
+        <h2>第三版：够用就好</h2>
+        <p>现在这版阵列只有 1.2 毫米，每个指尖 64 个感应单元，最小可感知约 0.2 N。它不是我们测过最灵敏的方案，但它薄到可以直接贴在金属指节下面，外观上几乎看不出来；在二十万次抓放之后，读数漂移仍在 3% 以内。</p>
+        <blockquote>我们最后的判断标准是：如果它让手指看起来不像手指了，那么再好的数据也不值得。</blockquote>
+        <p>下一步是把同样的阵列延伸到指腹和掌心。掌心的面积大得多，布线会是主要难题，我们会在下一篇日志里记录进展。</p>
+      </div>
+      <nav class="article-next wrap-narrow" aria-label="更多文章"><span>下一篇</span><a href="/journal/visor">一道弧面的十七个版本</a></nav>
+    </article>
+  </main>
+  <footer class="site-foot">
+    <div class="wrap foot-grid">
+      <div class="foot-brand"><a class="brand" href="/"><img src="/assets/mark.svg" alt="" width="28" height="28"><span>FORMA</span></a><p>以人为尺度的机器人设计工作室。</p></div>
+      <nav aria-label="站点"><h2>站点</h2><a href="/">FORMA 01</a><a href="/journal">设计日志</a><a href="/about">关于我们</a></nav>
+      <nav aria-label="联系"><h2>联系</h2><a data-mail="hello" href="/about#contact">合作咨询</a><a data-mail="press" href="/about#contact">媒体</a><a href="/about#jobs">加入我们</a></nav>
+    </div>
+    <div class="wrap foot-base"><span>© <span data-year>2026</span> FORMA Robotics</span><a href="/privacy">隐私说明</a></div>
+  </footer>
+</body>
+</html>

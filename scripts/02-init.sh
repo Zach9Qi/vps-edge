@@ -30,6 +30,8 @@ if [ "$EDGE_ROLE" = edge ]; then
         || warn "REALITY_SNI 用的是根域名，建议改用专用子域名（如 www.$REALITY_CERT_DOMAIN）"
     port_ok "$DECOY_PORT" \
         || die ".env 里 DECOY_PORT=${DECOY_PORT:-（空）} 不对：填 1-65535 之间的端口（如 3000），不能用 443 / 8443 / 10443"
+    decoy_theme_ok "$DECOY_THEME" \
+        || die ".env 里 DECOY_THEME=$DECOY_THEME 不对：apps/decoy/themes/ 下没有这个主题，可选：$(decoy_themes | tr '\n' ' ')（或者运行 edge theme 选择）"
 else
     [ -n "$EXIT_LISTEN" ] || die "出口模式（EDGE_ROLE=exit）必须在 .env 填写 EXIT_LISTEN=内网IP:端口，或者运行 edge internal 设置"
     DECOY_PORT=""

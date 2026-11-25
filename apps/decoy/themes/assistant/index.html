@@ -1,0 +1,114 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#e8edf3">
+  <meta name="description" content="Oriel 是一个记得住你生活细节的 AI 私人助手：日程、笔记、待办和家里的大小事，随口一说就能交给它。">
+  <meta property="og:title" content="Oriel：记得住的 AI 私人助手">
+  <meta property="og:description" content="把生活里的琐事，交给一个记得住的助手。">
+  <title>Oriel：记得住的 AI 私人助手</title>
+  <link rel="icon" href="/assets/mark.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="/style.css">
+  <script src="/site.js" defer></script>
+</head>
+<body>
+  <a class="skip" href="#main">跳至正文</a>
+  <header class="top">
+    <nav class="wrap nav" aria-label="主导航">
+      <a class="brand" href="/" aria-label="Oriel 首页"><img src="/assets/mark.svg" alt="" width="30" height="30"><span>Oriel</span></a>
+      <div class="nav-links"><a href="/#features">它能做什么</a><a href="/pricing">价格</a><a href="/changelog">更新日志</a></div>
+      <a class="pill pill-small" data-mail="beta" href="/pricing#beta">申请内测</a>
+    </nav>
+  </header>
+  <main id="main">
+    <div class="hero-band">
+    <section class="hero wrap" aria-labelledby="hero-title">
+      <div class="hero-copy">
+        <h1 id="hero-title">把生活里的琐事，<br>交给一个记得住的助手。</h1>
+        <p class="lead">日程、笔记、待办，还有那些你总怕忘掉的小事。随口告诉 Oriel，它会整理好，并在合适的时候提醒你。</p>
+        <div class="actions">
+          <a class="pill" data-mail="beta" href="/pricing#beta">申请内测</a>
+          <a class="quiet-link" href="/pricing">查看价格</a>
+        </div>
+        <p class="note">目前为邀请制内测，支持 iPhone、Android 和网页版。</p>
+      </div>
+      <figure class="window" aria-label="对话演示">
+        <div class="window-glass">
+          <p class="window-status"><span class="dot" aria-hidden="true"></span>Oriel 在线</p>
+          <ol class="chat" id="demo">
+            <li class="msg me">下周三下午帮我留两小时，跟装修师傅对一下橱柜。</li>
+            <li class="msg ai">好的，周三 14:00 到 16:00 已经留出来了。上次师傅说台面要等石材到货，要不要我周二提醒你先打电话确认？</li>
+            <li class="msg me">好，顺便提醒我带上量好的尺寸。</li>
+            <li class="msg ai">记下了。尺寸在你 11 月 3 日的笔记里：台面长 2.86 米，水槽开孔 78 × 45 厘米。周二上午 10 点我一起提醒你。</li>
+          </ol>
+          <button type="button" class="replay" id="replay" hidden>重新播放</button>
+        </div>
+      </figure>
+    </section>
+    </div>
+
+    <section class="features wrap" id="features" aria-labelledby="features-title">
+      <h2 id="features-title">它记得你说过的话</h2>
+      <p class="section-lead">大多数助手每次对话都从零开始。Oriel 会把你提过的人、地方和约定记下来，下次直接用上。</p>
+      <div class="feature">
+        <div class="feature-text"><h3>安排日程，顺带想到前因后果</h3><p>不只是在日历上占个位置。它知道这件事和哪些人、哪些待办有关，会在需要准备的时候提前告诉你。</p></div>
+        <div class="snippet"><p class="msg me">周五和小林吃饭，订个地方。</p><p class="msg ai">小林上次说在控制饮食，我找了三家有轻食的店，都在你们公司步行十分钟内。要先看看吗？</p></div>
+      </div>
+      <div class="feature">
+        <div class="feature-text"><h3>家里的事，一家人共用</h3><p>家庭版里，每个人都可以把事情交给同一个 Oriel。谁去接孩子、物业费交了没有，不用再在群里翻聊天记录。</p></div>
+        <div class="snippet"><p class="msg me">这个月物业费交了吗？</p><p class="msg ai">妈妈 11 月 2 日已经交了，共 486 元，收据照片在家庭相册里。</p></div>
+      </div>
+      <div class="feature">
+        <div class="feature-text"><h3>随手记，回头找得到</h3><p>拍一张照片、说一段语音、转发一条消息都行。之后用自己的话问它，不需要记住当时存在了哪里。</p></div>
+        <div class="snippet"><p class="msg me">去年给爸买的那个血压计是什么牌子？</p><p class="msg ai">是你去年 9 月 14 日拍的那张发票：欧姆龙 U32，保修到明年 9 月。</p></div>
+      </div>
+    </section>
+
+    <section class="steps-wrap" aria-labelledby="steps-title">
+      <div class="wrap">
+        <h2 id="steps-title">它是怎么记住的</h2>
+        <ol class="steps">
+          <li><h3>你随口一说</h3><p>用文字、语音或者转发都可以，不需要固定格式，也不用先分类。</p></li>
+          <li><h3>它整理成记忆</h3><p>Oriel 从对话里提取人、时间、地点和约定，存成你随时可以查看、修改和删除的条目。</p></li>
+          <li><h3>在合适的时候提起</h3><p>到了相关的时间或地点，或者你问到相关的事，它会把这些记忆用上，而不是让你再说一遍。</p></li>
+        </ol>
+      </div>
+    </section>
+
+    <section class="privacy-band" aria-labelledby="privacy-title">
+      <div class="wrap privacy-grid">
+        <div><h2 id="privacy-title">你的记忆只属于你</h2><p>一个记得住事情的助手，必须先让人放心。</p></div>
+        <ul class="promises">
+          <li><h3>不拿你的数据训练模型</h3><p>对话和记忆只用来为你服务，不会用于训练任何模型。</p></li>
+          <li><h3>每一条记忆都看得见</h3><p>它记住了什么，你都能在“记忆”页面里看到，可以随时修改或删除。</p></li>
+          <li><h3>传输与存储全程加密</h3><p>数据在传输和存储时都经过加密，工作人员无法查看对话内容。</p></li>
+          <li><h3>一键导出，一键清空</h3><p>你可以随时导出全部数据，注销账号后 30 天内彻底删除。</p></li>
+        </ul>
+      </div>
+    </section>
+
+    <section class="voices wrap" aria-labelledby="voices-title">
+      <h2 id="voices-title">内测用户怎么说</h2>
+      <div class="voice-list">
+        <figure><blockquote>以前我的待办散在三个应用和一堆便签里。现在只要跟它说一声，最神奇的是它会记得我上周提过的事。</blockquote><figcaption>陈女士，产品经理，两个孩子的妈妈</figcaption></figure>
+        <figure><blockquote>我爸妈也在用家庭版。上次我妈问它“阿姨的电话是多少”，它知道是哪个阿姨。</blockquote><figcaption>周先生，独立摄影师</figcaption></figure>
+      </div>
+    </section>
+
+    <section class="cta wrap" aria-labelledby="cta-title">
+      <h2 id="cta-title">想试试 Oriel？</h2>
+      <p>内测名额每周开放一次。发一封邮件给我们，简单说说你打算用它做什么，我们会在一周内回复。</p>
+      <a class="pill" data-mail="beta" href="/pricing#beta">写信申请内测</a>
+    </section>
+  </main>
+  <footer class="foot">
+    <div class="wrap foot-grid">
+      <div><a class="brand" href="/"><img src="/assets/mark.svg" alt="" width="26" height="26"><span>Oriel</span></a><p>记得住的 AI 私人助手。</p></div>
+      <nav aria-label="产品"><h2>产品</h2><a href="/#features">它能做什么</a><a href="/pricing">价格</a><a href="/changelog">更新日志</a></nav>
+      <nav aria-label="支持"><h2>支持</h2><a href="/pricing#faq">常见问题</a><a data-mail="support" href="/pricing#faq">联系客服</a><a href="/privacy">隐私政策</a></nav>
+    </div>
+    <div class="wrap foot-base"><span>© <span data-year>2026</span> Oriel</span><span>为每一个忙碌的人</span></div>
+  </footer>
+</body>
+</html>

@@ -1,0 +1,114 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#fafaf8">
+  <meta name="description" content="FORMA 01 人形机器人概念设计，探索感知、动作与人的距离。">
+  <meta property="og:title" content="FORMA Robotics · FORMA 01">
+  <meta property="og:description" content="一款关于目光、触碰与动作的人形机器人概念设计。">
+  <meta property="og:image" content="/assets/portrait.jpg">
+  <title>FORMA Robotics · FORMA 01</title>
+  <link rel="icon" href="/assets/mark.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="/style.css">
+  <script src="/site.js" defer></script>
+  <script src="/gallery.js" defer></script>
+</head>
+<body>
+  <a class="skip" href="#main">跳至正文</a>
+  <header class="mast">
+    <nav class="wrap nav" aria-label="主导航">
+      <a class="brand" href="/" aria-label="FORMA Robotics 首页"><img src="/assets/mark.svg" alt="" width="32" height="32"><span>FORMA</span><small>ROBOTICS</small></a>
+      <div class="nav-links"><a href="/" aria-current="page">FORMA 01</a><a href="/journal">设计日志</a><a href="/about">关于我们</a></div>
+    </nav>
+  </header>
+  <main id="main">
+    <section class="hero" id="overview" aria-labelledby="hero-title">
+      <img class="hero-img" src="/assets/portrait.jpg" width="1672" height="941" fetchpriority="high" alt="FORMA 01 的银白色头部与上半身，黑色弧面面罩下露出颈部机械结构">
+      <div class="hero-shade"></div>
+      <div class="hero-inner wrap">
+        <div class="hero-copy">
+          <p class="kicker"><i></i>FORMA 01</p>
+          <h1 id="hero-title">智能，<br>初具人形<span>。</span></h1>
+          <p class="lead">一款关于目光、触碰与动作的<br>人形机器人概念设计。</p>
+          <a class="button" href="#design">探索设计</a>
+          <button type="button" class="gallery-link" data-open-view="optic" hidden>打开细节图册</button>
+        </div>
+        <div class="hero-foot"><span>HUMANOID ROBOT</span><span>整机视图</span></div>
+      </div>
+    </section>
+    <section id="design" class="design wrap" aria-labelledby="design-title">
+      <p class="section-label"><i></i>INDUSTRIAL DESIGN</p>
+      <div class="section-heading"><h2 id="design-title">近看，才见细节。</h2><p>从连续的外壳曲面，到关节间的留白。</p></div>
+      <div class="studies">
+        <figure class="study"><div class="detail optic" data-view="optic" data-name="弧面面罩"><img src="/assets/portrait.jpg" loading="lazy" alt="烟色面罩与银白头壳的曲面衔接"><button type="button" class="inspect" data-open-view="optic" aria-label="放大查看弧面面罩" hidden></button></div>
+          <figcaption><span class="english">OPTICS</span><h3>一道弧面，收拢目光。</h3><p>深色面罩沿头部轮廓延伸，将视觉元件藏进一片连续的反光里。</p></figcaption>
+        </figure>
+        <figure class="study"><div class="detail joint" data-view="joint" data-name="颈肩关节"><img src="/assets/portrait.jpg" loading="lazy" alt="颈部连杆与肩部的金属转轴"><button type="button" class="inspect" data-open-view="joint" aria-label="放大查看颈肩关节" hidden></button></div>
+          <figcaption><span class="english">ARTICULATION</span><h3>让转动的结构可见。</h3><p>颈部连杆与肩轴之间保留间隙，露出壳体之下彼此咬合的机械层次。</p></figcaption>
+        </figure>
+      </div>
+    </section>
+    <section id="interaction" class="interaction" aria-labelledby="interaction-title">
+      <div class="wrap">
+        <p class="section-label"><i></i>PHYSICAL INTERACTION</p>
+        <h2 id="interaction-title">从一次轻触开始。</h2>
+        <p class="interaction-copy">设想桌上有一颗小球。手指缓缓靠近，在相对的两个点合拢，<br class="wide-only">把它从桌面轻轻托起。</p>
+        <figure class="touch"><div class="touch-photo" data-view="hand" data-name="指尖抓取"><img src="/assets/touch.jpg" width="1672" height="941" loading="lazy" alt="分节的金属手指轻轻捏住一颗橙色小球"><button type="button" class="inspect" data-open-view="hand" aria-label="放大查看指尖抓取" hidden></button></div><figcaption>FORMA 01 <span>/</span> 指尖抓取构想</figcaption></figure>
+      </div>
+    </section>
+    <section id="specs" class="specs wrap" aria-labelledby="specs-title">
+      <p class="section-label"><i></i>DESIGN TARGETS</p>
+      <div class="section-heading"><h2 id="specs-title">以人为尺度。</h2><p>以下为第二代样机的设计目标值，量产前仍会调整。</p></div>
+      <dl class="spec-grid">
+        <div><dt>身高</dt><dd>168<small>cm</small></dd><p>与成年人平视，不需要俯身交谈。</p></div>
+        <div><dt>整机重量</dt><dd>58<small>kg</small></dd><p>铝镁合金骨架，外壳为可更换的复合材料。</p></div>
+        <div><dt>全身自由度</dt><dd>41</dd><p>其中颈部 3 个，可做点头与侧倾。</p></div>
+        <div><dt>单手自由度</dt><dd>12</dd><p>指尖内置触觉阵列，最小可感知约 0.2 N 的接触力。</p></div>
+        <div><dt>连续工作</dt><dd>4.5<small>h</small></dd><p>背部电池模块可热插拔，更换约 40 秒。</p></div>
+        <div><dt>运行噪声</dt><dd>&lt;42<small>dB</small></dd><p>相当于安静图书馆的环境音。</p></div>
+      </dl>
+    </section>
+    <section class="progress" aria-labelledby="progress-title">
+      <div class="wrap">
+        <p class="section-label"><i></i>DEVELOPMENT</p>
+        <div class="section-heading"><h2 id="progress-title">从草图到样机。</h2><p>每一阶段的过程记录都发在<a class="text-link" href="/journal">设计日志</a>里。</p></div>
+        <ol class="timeline">
+          <li><time datetime="2024-03">2024.03</time><h3>第一张草图</h3><p>确定“不做脸，只做目光”的方向：头部只保留一道面罩。</p></li>
+          <li><time datetime="2024-11">2024.11</time><h3>一比一外观模型</h3><p>用泡沫与 3D 打印件拼出全身比例，在办公室里放了两个月，观察同事的反应。</p></li>
+          <li><time datetime="2025-08">2025.08</time><h3>第一代可动样机</h3><p>上半身 23 个自由度，完成第一次稳定抓取。</p></li>
+          <li><time datetime="2026-06">2026.06</time><h3>第二代样机</h3><p>换用自研指尖触觉阵列，整机减重 9 kg。</p></li>
+        </ol>
+      </div>
+    </section>
+    <section class="latest wrap" aria-labelledby="latest-title">
+      <div class="section-heading"><h2 id="latest-title">设计日志</h2><a class="text-link" href="/journal">查看全部</a></div>
+      <ul class="post-list">
+        <li><a href="/journal/fingertip"><time datetime="2026-10-14">2026.10.14</time><h3>第三版指尖：把触觉做薄</h3><p>为什么我们放弃了更灵敏的方案，换成一层只有 1.2 毫米的阵列。</p></a></li>
+        <li><a href="/journal/visor"><time datetime="2026-07-02">2026.07.02</time><h3>一道弧面的十七个版本</h3><p>面罩的曲率决定了它看起来是在“注视”还是在“盯着”。</p></a></li>
+        <li><a href="/journal/neck"><time datetime="2026-03-19">2026.03.19</time><h3>颈部：留出看得见的间隙</h3><p>把机械结构藏起来很容易，难的是让它露出来也好看。</p></a></li>
+      </ul>
+    </section>
+  </main>
+  <footer class="site-foot">
+    <div class="wrap foot-grid">
+      <div class="foot-brand"><a class="brand" href="/"><img src="/assets/mark.svg" alt="" width="28" height="28"><span>FORMA</span></a><p>以人为尺度的机器人设计工作室。</p></div>
+      <nav aria-label="站点"><h2>站点</h2><a href="/">FORMA 01</a><a href="/journal">设计日志</a><a href="/about">关于我们</a></nav>
+      <nav aria-label="联系"><h2>联系</h2><a data-mail="hello" href="/about#contact">合作咨询</a><a data-mail="press" href="/about#contact">媒体</a><a href="/about#jobs">加入我们</a></nav>
+    </div>
+    <div class="wrap foot-base"><span>© <span data-year>2026</span> FORMA Robotics</span><a href="/privacy">隐私说明</a></div>
+  </footer>
+  <dialog class="gallery" aria-labelledby="gallery-title">
+    <header class="gallery-bar"><h2 id="gallery-title">FORMA 01 <span>/ 细节图册</span></h2><form method="dialog"><button class="gallery-close" aria-label="关闭图册" autofocus>×</button></form></header>
+    <div class="gallery-frame"><div class="gallery-crop"><img class="gallery-photo" alt=""></div></div>
+    <div class="gallery-bar gallery-controls">
+      <p class="gallery-caption" aria-live="polite" aria-atomic="true"></p>
+      <div class="gallery-actions">
+        <button type="button" id="previous">上一张</button>
+        <button type="button" id="zoom" aria-label="放大细节" aria-pressed="false">放大</button>
+        <button type="button" id="next">下一张</button>
+      </div>
+    </div>
+  </dialog>
+</body>
+</html>

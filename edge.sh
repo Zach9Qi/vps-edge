@@ -8,6 +8,7 @@
 #   edge add <域名> <应用名>  发布 apps/<应用名>：自动分配端口、构建启动、签证书、配好 HTTPS
 #   edge add <域名> <端口>    或者反代到一个已经在运行的服务
 #   edge up [应用名]          改了应用代码后重新构建、重启（不带参数 = 全部应用）
+#   edge theme [主题名]       切换伪装站主题（不带参数会列出来让你选）
 #   edge remove [域名]        删除网站，并停止对应的应用（不带参数会列出来让你选）
 #   edge sites               查看已有网站
 #   edge check               健康检查
@@ -154,6 +155,27 @@ ask_port() {
     printf -v "$__v" '%s' "$__port"
 }
 
+# ask_theme <变量名> [当前主题]：列出 apps/decoy/themes/ 下的主题，按序号选择
+ask_theme() {
+    local __v="$1" __cur="${2:-forma}" __list __i __def=1 __n __mark
+    mapfile -t __list < <(decoy_themes)
+    [ ${#__list[@]} -gt 0 ] || die "apps/decoy/themes/ 下没有主题（每个主题一个目录，里面要有 index.html）"
+    echo
+    echo "  伪装站主题："
+    for __i in "${!__list[@]}"; do
+        __mark=""
+        if [ "${__list[$__i]}" = "$__cur" ]; then __mark="（当前）"; __def=$((__i + 1)); fi
+        printf '    %d) %-12s %s%s\n' $((__i + 1)) "${__list[$__i]}" "$(decoy_theme_desc "${__list[$__i]}")" "$__mark"
+    done
+    while :; do
+        read -rp "选择伪装站主题（序号）[$__def]: " __n
+        __n="${__n:-$__def}"
+        if [[ "$__n" =~ ^[0-9]+$ ]] && [ "$__n" -ge 1 ] && [ "$__n" -le ${#__list[@]} ]; then break; fi
+        warn "填 1-${#__list[@]} 之间的序号"
+    done
+    printf -v "$__v" '%s' "${__list[$((__n - 1))]}"
+}
+
 # pick_internal <变量名>：交互选择内网入口地址（列出本机的内网 IP），结果形如 10.0.0.2:23456
 pick_internal() {
     local __v="$1" __cur __ip="" __port __ips __n __i __line
@@ -247,6 +269,10 @@ wizard() {
             env_set DECOY_PORT "${decoy:-3000}"
             log "伪装站端口 DECOY_PORT=${decoy:-3000}"
         fi
+        if [ -z "$(env_get DECOY_THEME)" ]; then  # 旧版 .env：沿用原来的伪装站 forma
+            env_set DECOY_THEME forma
+            log "伪装站主题 DECOY_THEME=forma（换主题：edge theme）"
+        fi
         return 0    # .env 已经填好，不再询问
     fi
     [ -t 0 ] || die ".env 还没填好：请编辑 $f，或者在终端里运行 bash edge.sh 按提示填写"
@@ -257,7 +283,7 @@ wizard() {
 
 # wizard_ask：完整问答（首次安装时）
 wizard_ask() {
-    local f="$1" sni="$2" token="$3" email="$4" decoy="$5" zone cert rc
+    local f="$1" sni="$2" token="$3" email="$4" decoy="$5" zone cert rc theme
     is_example "$sni" && sni=""
     is_example "${email#*@}" && email=""
 
@@ -268,7 +294,7 @@ wizard_ask() {
   1. 给伪装站用的域名（如 www.你的域名.com），A/AAAA 记录指向本机，灰云（仅 DNS）
   2. API Token：My Profile → API Tokens → Create Token → Custom token
      权限 Zone → DNS → Edit 和 Zone → Zone → Read，Zone Resources 选你的域名
-伪装站应用放在 apps/decoy/，安装时会按你填的端口自动构建并启动
+伪装站应用放在 apps/decoy/，安装时会按你选的主题和端口自动构建并启动
 EOF
     echo
     while :; do
@@ -290,12 +316,14 @@ EOF
 
     ask email "Let's Encrypt 邮箱" "$email"
     ask_port decoy "$decoy"
+    ask_theme theme "$(env_get DECOY_THEME)"
 
     env_set REALITY_SNI "$sni"
     env_set REALITY_CERT_DOMAIN "$cert"
     env_set CF_Token "$token"
     env_set ACME_EMAIL "$email"
     env_set DECOY_PORT "$decoy"
+    env_set DECOY_THEME "$theme"
     log "已保存到 $f（以后想改，编辑它然后运行 edge apply）"
 }
 
@@ -428,7 +456,10 @@ cmd_up() {
     need_edge_role
     load_env
     local name="${1:-}" port fails=0
-    if [ -n "$name" ]; then
+    if [ "$name" = decoy ]; then
+        decoy_up pull
+        return
+    elif [ -n "$name" ]; then
         app_exists "$name" || die "apps/$name/ 下没有 compose.yaml"
         port="$(app_port "$name")" || die "apps/$name 还没有发布：先运行 edge add <域名> $name"
         app_up "$name" "$port" pull
@@ -441,6 +472,34 @@ cmd_up() {
         app_up "$name" "$port" pull || { warn "apps/$name 更新失败"; fails=$((fails + 1)); }
     done < <(published_apps)
     [ "$fails" -eq 0 ] || die "$fails 个应用更新失败，见上面的报错"
+}
+
+# cmd_theme [主题名]：切换伪装站主题；不带参数时列出主题按序号选择
+cmd_theme() {
+    need_edge_role
+    load_env
+    local t="${1:-}" old="$DECOY_THEME"
+    if [ -z "$t" ]; then
+        if [ ! -t 0 ]; then
+            log "伪装站主题：$DECOY_THEME（可选：$(decoy_themes | tr '\n' ' ')；切换：edge theme <主题名>）"
+            return 0
+        fi
+        ask_theme t "$DECOY_THEME"
+    fi
+    decoy_theme_ok "$t" || die "没有这个主题：$t（可选：$(decoy_themes | tr '\n' ' ')）"
+    if [ "$t" = "$old" ]; then
+        log "伪装站已经是 $t 主题，不用切换（改了页面后重新构建：edge up decoy）"
+        return 0
+    fi
+    env_set DECOY_THEME "$t"
+    DECOY_THEME="$t"
+    if ! decoy_up; then
+        env_set DECOY_THEME "$old"
+        DECOY_THEME="$old"
+        decoy_up || true
+        die "切换失败，已恢复为 $old（原因见上）"
+    fi
+    log "伪装站已切换为 $t：https://$REALITY_SNI（浏览器有缓存的话强制刷新一下）"
 }
 
 # 已发布的业务应用全部构建、启动（install 时用：换机器恢复、或容器被删掉之后）
@@ -465,7 +524,7 @@ cmd_sites() {
     need_edge_role
     load_env
     local d up app n=0
-    printf '  %-36s → 127.0.0.1:%s（伪装站 apps/decoy）\n' "$REALITY_SNI" "$DECOY_PORT"
+    printf '  %-36s → 127.0.0.1:%s（伪装站 apps/decoy，主题 %s）\n' "$REALITY_SNI" "$DECOY_PORT" "$DECOY_THEME"
     while read -r d; do
         [ -n "$d" ] || continue
         up="$({ grep -oE 'proxy_pass[[:space:]]+http://[^;]+' "$CONF_DIR/$d.conf" || true; } \
@@ -870,12 +929,13 @@ menu_edge() {
   4) 删除网站
   5) 查看已有网站
   6) 更新应用（改了 apps/ 里的代码后）
-  7) 改了 .env 后重新生成配置
-  8) 更新所有镜像
-  9) 重新安装 / 修复
- 10) 轮换 Xray 密钥
- 11) 查看 Xray 配置
- 12) 链式代理（上游 / 通行证 / 内网入口）
+  7) 切换伪装站主题
+  8) 改了 .env 后重新生成配置
+  9) 更新所有镜像
+ 10) 重新安装 / 修复
+ 11) 轮换 Xray 密钥
+ 12) 查看 Xray 配置
+ 13) 链式代理（上游 / 通行证 / 内网入口）
   0) 退出
 EOF
         read -rp "请选择: " c || exit 0
@@ -890,12 +950,13 @@ EOF
             6) echo "  已发布的应用：decoy $(published_apps | tr '\n' ' ')"
                read -rp "更新哪个（留空 = 全部）: " a
                bash "$SELF" up ${a:+"$a"} ;;
-            7) bash "$SELF" apply ;;
-            8) bash "$SELF" update ;;
-            9) bash "$SELF" install ;;
-            10) bash "$SELF" rotate-keys ;;
-            11) bash "$SELF" xray ;;
-            12) menu_chain ;;
+            7) bash "$SELF" theme ;;
+            8) bash "$SELF" apply ;;
+            9) bash "$SELF" update ;;
+            10) bash "$SELF" install ;;
+            11) bash "$SELF" rotate-keys ;;
+            12) bash "$SELF" xray ;;
+            13) menu_chain ;;
             0|q|"") exit 0 ;;
             *) warn "没有这个选项" ;;
         esac || true
@@ -958,6 +1019,7 @@ case "$cmd" in
     install)     cmd_install ;;
     add)         cmd_add "$@" ;;
     up)          cmd_up "$@" ;;
+    theme)       cmd_theme "$@" ;;
     remove|rm)   cmd_remove "$@" ;;
     sites|ls)    cmd_sites ;;
     check)       bash "$S/check.sh" ;;

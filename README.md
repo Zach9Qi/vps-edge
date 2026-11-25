@@ -19,7 +19,7 @@
 cd /opt/edge && bash edge.sh
 ```
 
-脚本先问这台机器的用途（完整节点 / 纯内网出口，默认完整节点，纯内网出口见 8.4 节），完整节点再问 4 个问题（伪装站域名、Cloudflare Token、邮箱、伪装站端口（默认 3000，回车即可）），然后自动完成：补装工具、开 BBR → 签证书 → 生成密钥和配置、启动伪装站应用 → 启动容器 → 健康检查 → 打印客户端分享链接。
+脚本先问这台机器的用途（完整节点 / 纯内网出口，默认完整节点，纯内网出口见 8.4 节），完整节点再问 5 个问题（伪装站域名、Cloudflare Token、邮箱、伪装站端口（默认 3000，回车即可）、伪装站主题（按序号选）），然后自动完成：补装工具、开 BBR → 签证书 → 生成密钥和配置、启动伪装站应用 → 启动容器 → 健康检查 → 打印客户端分享链接。
 
 装完以后：
 
@@ -27,6 +27,7 @@ cd /opt/edge && bash edge.sh
 edge                          打开菜单（所有操作都在里面）
 edge add blog.example.com blog 发布 apps/blog（自动分配端口、构建启动、签证书）
 edge up blog                  改了 apps/blog 的代码后重新构建、重启
+edge theme                    切换伪装站主题（列出来按序号选）
 edge check                    健康检查
 edge client                   再看一次分享链接
 edge chain                    链式代理菜单（上游 / 通行证 / 内网入口）
@@ -94,7 +95,10 @@ vps-edge/                       → 上传到 VPS 的 /opt/edge
 │   └── relays.env              ← 已发出的通行证（edge relay 维护，请备份）
 ├── certs/<根域名>/             ← acme.sh 安装的证书
 ├── apps/                       应用，每个一个目录（edge 自动构建、启动，见第 5 节）
-│   └── decoy/                  伪装站
+│   └── decoy/                  伪装站（见第 6 节）
+│       ├── themes/forma/       主题：FORMA Robotics（人形机器人设计工作室）
+│       ├── themes/assistant/   主题：Oriel（AI 私人助手产品站）
+│       └── nginx.conf          容器内的静态站配置（所有主题共用）
 ├── logs/nginx/                 ← nginx 的 access.log / error.log
 ├── host/logrotate-nginx.tpl    日志轮转规则
 └── scripts/                    edge.sh 内部调用的步骤脚本，平时不用直接运行
@@ -104,23 +108,24 @@ vps-edge/                       → 上传到 VPS 的 /opt/edge
 
 | 命令 | 菜单项 | 作用 |
 |---|---|---|
-| `edge install` | 9 | 一键安装 / 修复。可以重复执行：已有的密钥、证书、配置、应用都会复用，不会让客户端失效 |
+| `edge install` | 10 | 一键安装 / 修复。可以重复执行：已有的密钥、证书、配置、应用都会复用，不会让客户端失效 |
 | `edge add <域名> <应用名>` | 3 | 发布 `apps/<应用名>`：自动分配端口、构建启动、签证书（需要时）、配好 HTTPS |
 | `edge add <域名> <端口>` | 3 | 反代到一个已经在运行的服务 |
 | `edge up [应用名]` | 6 | 应用重新构建、重启（会先拉取最新基础镜像）；不带参数 = 全部应用 |
+| `edge theme [主题名]` | 7 | 切换伪装站主题：不带参数列出所有主题按序号选，切换后自动重新构建 |
 | `edge remove [域名]` | 4 | 删除网站，对应的应用没有其他网站在用时一并停止（目录保留） |
 | `edge sites` | 5 | 查看已有网站、各自的后端和应用 |
 | `edge check` | 1 | 检查容器、端口、证书剩余天数、伪装站、各站点、对外暴露的端口 |
 | `edge client` | 2 | 打印分享链接和 mihomo 配置片段 |
-| `edge apply` | 7 | 改了 `.env` 或模板之后重新生成配置，自动重载（密钥不变） |
-| `edge update` | 8 | 拉取 nginx / Xray 新镜像并重启，再 `edge up` 全部应用 |
-| `edge rotate-keys` | 10 | 轮换 Xray 密钥（旧客户端和所有通行证的链接都失效，需要重新导入） |
+| `edge apply` | 8 | 改了 `.env` 或模板之后重新生成配置，自动重载（密钥不变） |
+| `edge update` | 9 | 拉取 nginx / Xray 新镜像并重启，再 `edge up` 全部应用 |
+| `edge rotate-keys` | 11 | 轮换 Xray 密钥（旧客户端和所有通行证的链接都失效，需要重新导入） |
 | `edge logs [nginx\|xray]` | | 实时查看日志 |
-| `edge xray [--raw]` | 11 | 查看 Xray 实际配置（私钥、密码默认隐藏，`--raw` 显示完整），并提示配置是否已生效 |
-| `edge chain` | 12 | 链式代理菜单：上游、通行证、内网入口都在里面 |
-| `edge upstream ...` | 12 → 1~3 | 设置 / 测试 / 取消上游（本机流量全部转给另一台机器出去），见 8.6 节 |
-| `edge relay ...` | 12 → 4~6 | 发放 / 查看 / 吊销通行证（让别的机器把本机当上游），见 8.6 节 |
-| `edge internal ...` | 12 → 7~8 | 开启 / 修改 / 关闭内网入口（给同一内网的入口机用），见 8.6 节 |
+| `edge xray [--raw]` | 12 | 查看 Xray 实际配置（私钥、密码默认隐藏，`--raw` 显示完整），并提示配置是否已生效 |
+| `edge chain` | 13 | 链式代理菜单：上游、通行证、内网入口都在里面 |
+| `edge upstream ...` | 13 → 1~3 | 设置 / 测试 / 取消上游（本机流量全部转给另一台机器出去），见 8.6 节 |
+| `edge relay ...` | 13 → 4~6 | 发放 / 查看 / 吊销通行证（让别的机器把本机当上游），见 8.6 节 |
+| `edge internal ...` | 13 → 7~8 | 开启 / 修改 / 关闭内网入口（给同一内网的入口机用），见 8.6 节 |
 
 内网出口模式（`EDGE_ROLE=exit`）的菜单只有和 Xray、链式代理有关的项，网站相关的命令（`add` / `up` / `remove` / `sites` / `logs nginx`）不可用。
 
@@ -145,7 +150,7 @@ vps-edge/                       → 上传到 VPS 的 /opt/edge
 - Debian / Ubuntu，已安装 Docker 和 docker compose 插件
 - **安全组**：入站只保留 SSH 端口（TCP）和 443（TCP），80 不放行；出站全部放行（签证书要访问 Cloudflare API 和 Let's Encrypt）
 - 所有命令都以 root 身份执行
-- **伪装站页面**：放在 `apps/decoy/`，安装时会自动构建并启动（见第 6 节）
+- **伪装站页面**：自带两套主题（`apps/decoy/themes/`），安装时按序号选一套，自动构建并启动（见第 6 节）
 
 ---
 
@@ -236,10 +241,27 @@ stream 分流规则和 Xray 配置都不用改：不是伪装站域名的流量�
 
 伪装站就是访问伪装站域名（`REALITY_SNI`）时看到的网站，REALITY 认证失败的流量（浏览器访问、主动探测）都会落到这里。它就是 `apps/decoy/` 这个应用，和第 5 节的应用写法一样，区别只是端口固定用 `.env` 的 `DECOY_PORT`（默认 3000），由 `edge install` / `edge apply` 自动构建、启动，并生成 `nginx/conf.d/00-decoy.conf`。
 
+### 6.1 主题
+
+`apps/decoy/themes/` 下每个目录是一套完整的网站，同一时间只用一套，由 `.env` 的 `DECOY_THEME` 决定：
+
+| 主题 | 内容 |
+|---|---|
+| `forma` | FORMA Robotics：人形机器人设计工作室。产品页、设计日志（3 篇文章）、关于我们 / 团队 / 招聘、隐私说明 |
+| `assistant` | Oriel：AI 私人助手（邀请制内测）。首页对话演示、价格与常见问题、更新日志、隐私政策 |
+
+两套都是纯静态页面：没有登录、注册、表单这类点了没反应的功能，联系方式一律是邮件，邮箱域名由页面脚本按访问的域名自动生成（`hello@你的域名`），换域名不用改页面。另外都带 404 页面、`robots.txt` 和干净的网址（`/pricing`、`/journal/visor`）。
+
+**多台机器建议用不同的主题**：几台 VPS 显示一模一样的网站，本身就是一个可以把它们关联起来的特征。
+
+### 6.2 常用操作
+
 | 想做的事 | 操作 |
 |---|---|
-| 改页面内容 | 改 `apps/decoy/` 里的文件，然后 `edge up decoy` |
-| 根目录新增文件（如 `about.html`） | 在 `apps/decoy/Dockerfile` 第一行 `COPY` 里加上文件名（`assets/` 里加图片不用改），然后 `edge up decoy` |
+| 换主题 | `edge theme`（或菜单 7）：列出所有主题，按序号选，自动重新构建；也可以直接 `edge theme assistant` |
+| 改页面内容 | 改 `apps/decoy/themes/<主题>/` 里的文件，然后 `edge up decoy` |
+| 新增页面 | 在主题目录里放 `xxx.html`，访问地址就是 `/xxx`；不用改 Dockerfile |
+| 加一套自己的主题 | 新建 `apps/decoy/themes/<名字>/`，至少要有 `index.html`（建议再放一个 `404.html`）；再建一个 `.about` 文件，第一行写一句说明，会显示在 `edge theme` 的列表里（构建时会被排除，不会出现在网站上） |
 | 换端口 | 改 `.env` 的 `DECOY_PORT`，然后 `edge apply` |
 
 注意：

@@ -1,0 +1,50 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#fafaf8">
+  <meta name="description" content="FORMA 01 面罩曲率的迭代记录。">
+  <title>一道弧面的十七个版本 · FORMA Robotics</title>
+  <link rel="icon" href="/assets/mark.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="/style.css">
+  <script src="/site.js" defer></script>
+</head>
+<body>
+  <a class="skip" href="#main">跳至正文</a>
+  <header class="mast">
+    <nav class="wrap nav" aria-label="主导航">
+      <a class="brand" href="/" aria-label="FORMA Robotics 首页"><img src="/assets/mark.svg" alt="" width="32" height="32"><span>FORMA</span><small>ROBOTICS</small></a>
+      <div class="nav-links"><a href="/">FORMA 01</a><a href="/journal" aria-current="page">设计日志</a><a href="/about">关于我们</a></div>
+    </nav>
+  </header>
+  <main id="main">
+    <article class="article">
+      <header class="article-head wrap-narrow">
+        <a class="back" href="/journal">设计日志</a>
+        <h1>一道弧面的十七个版本</h1>
+        <p class="article-meta"><time datetime="2026-07-02">2026 年 7 月 2 日</time><span>林予舟</span></p>
+      </header>
+      <figure class="article-figure crop-visor wrap"><div class="frame"><img src="/assets/portrait.jpg" width="1672" height="941" alt="FORMA 01 的烟色弧面面罩"></div><figcaption>第十七版面罩，烟色聚碳酸酯，透光率 18%。</figcaption></figure>
+      <div class="prose wrap-narrow">
+        <p>FORMA 01 没有脸。项目开始时我们就决定不做眼睛、嘴巴这些容易让人产生错误期待的元素，头部只保留一道面罩，摄像头和深度传感器都藏在它后面。</p>
+        <p>这个决定让面罩成了整台机器上最难做的零件。它几乎承担了全部的“表情”。</p>
+        <h2>注视和盯着</h2>
+        <p>早期的几个版本曲率很大，面罩像一个向外鼓起的泡。测试时，同事们普遍觉得它“一直在盯着自己”，哪怕机器根本没开机。原因很简单：大曲率的反光会追着观察者移动，无论你站在哪里，都能看到一个亮点正对着自己。</p>
+        <p>从第九版开始，我们把水平方向的曲率压平，只在垂直方向保留弧度。反光变成了一条横向的带，它不再“看”你，而是像人的目光一样，有一个大致的朝向。</p>
+        <h2>颜色</h2>
+        <p>透光率我们试过 8% 到 40%。太暗，面罩像一块黑洞；太亮，又能看见里面的元件，显得机械。最后定在 18%：在室内光下看不清内部，但在强光下隐约能看到摄像头的轮廓。我们觉得这种“隐约”是诚实的，它在提醒你，这里确实有一只在看的眼睛。</p>
+      </div>
+      <nav class="article-next wrap-narrow" aria-label="更多文章"><span>下一篇</span><a href="/journal/neck">颈部：留出看得见的间隙</a></nav>
+    </article>
+  </main>
+  <footer class="site-foot">
+    <div class="wrap foot-grid">
+      <div class="foot-brand"><a class="brand" href="/"><img src="/assets/mark.svg" alt="" width="28" height="28"><span>FORMA</span></a><p>以人为尺度的机器人设计工作室。</p></div>
+      <nav aria-label="站点"><h2>站点</h2><a href="/">FORMA 01</a><a href="/journal">设计日志</a><a href="/about">关于我们</a></nav>
+      <nav aria-label="联系"><h2>联系</h2><a data-mail="hello" href="/about#contact">合作咨询</a><a data-mail="press" href="/about#contact">媒体</a><a href="/about#jobs">加入我们</a></nav>
+    </div>
+    <div class="wrap foot-base"><span>© <span data-year>2026</span> FORMA Robotics</span><a href="/privacy">隐私说明</a></div>
+  </footer>
+</body>
+</html>

@@ -44,6 +44,8 @@ load_env() {
     # 伪装站端口；兼容旧版 .env 里的 DECOY_UPSTREAM（3000 或 127.0.0.1:3000）
     DECOY_PORT="${DECOY_PORT:-${DECOY_UPSTREAM:-}}"
     DECOY_PORT="${DECOY_PORT##*:}"
+    # 伪装站主题：apps/decoy/themes/ 下的目录名（旧版 .env 没有这一项，用 forma）
+    DECOY_THEME="${DECOY_THEME:-forma}"
     ENABLE_IPV6="${ENABLE_IPV6:-auto}"
     NGINX_IMAGE="${NGINX_IMAGE:-nginx:stable-alpine}"
     XRAY_IMAGE="${XRAY_IMAGE:-$XRAY_IMAGE_DEFAULT}"
@@ -297,7 +299,33 @@ app_down() {  # app_down <名字>：停止并删除应用容器（目录和镜�
     (cd "$APPS_DIR/$1" && APP_PORT=1 docker compose down)
 }
 
-decoy_up() { app_up decoy "$DECOY_PORT" "${1:-}"; }  # decoy_up [pull]
+# decoy_up [pull]：按 DECOY_PORT 和 DECOY_THEME 构建并启动伪装站（主题变了会自动重新构建）
+decoy_up() {
+    decoy_theme_ok "${DECOY_THEME:-}" \
+        || { warn "伪装站主题 DECOY_THEME=${DECOY_THEME:-（空）} 不存在，可选：$(decoy_themes | tr '\n' ' ')"; return 1; }
+    log "伪装站主题：$DECOY_THEME"
+    DECOY_THEME="$DECOY_THEME" app_up decoy "$DECOY_PORT" "${1:-}"
+}
+
+# 伪装站主题：apps/decoy/themes/<名字>/ 是网站根目录（必须有 index.html）
+# 同目录下的 .about 第一行是给菜单看的说明（构建时被 .dockerignore 排除，不会出现在网站里）
+DECOY_THEMES_DIR="$APPS_DIR/decoy/themes"
+
+decoy_themes() {  # 列出所有主题
+    local d
+    for d in "$DECOY_THEMES_DIR"/*/; do
+        if [ -f "$d/index.html" ]; then basename "$d"; fi
+    done
+}
+
+decoy_theme_ok() {  # decoy_theme_ok <名字>：主题存在
+    [[ "$1" =~ ^[A-Za-z0-9._-]+$ ]] && [ -f "$DECOY_THEMES_DIR/$1/index.html" ]
+}
+
+decoy_theme_desc() {  # decoy_theme_desc <名字>：主题说明（没有就输出空）
+    local f="$DECOY_THEMES_DIR/$1/.about"
+    if [ -f "$f" ]; then sed -n '1{s/\r$//;p;}' "$f"; fi
+}
 
 site_app() {   # site_app <conf>：这个站点对应的应用名（没有就输出空）
     sed -n '1s/^# app=//p' "$1"
