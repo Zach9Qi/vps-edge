@@ -472,7 +472,11 @@ exit_listen_check() {
         warn "端口 $EXIT_PORT 不能用：填 1-65535，不能用 443 / 8443 / 10443 和伪装站端口"
         return 1
     fi
-    if command -v ip >/dev/null && ! ip -4 -o addr show 2>/dev/null | grep -qF " inet $EXIT_IP/"; then
+    # 先存进变量再 grep：直接 ip | grep -q 时，grep 匹配到就退出，ip 再写管道会被 SIGPIPE 杀掉，
+    # 在 pipefail 下整条管道算失败，导致明明有这个 IP 也报"没有"
+    local addrs
+    addrs="$(ip -4 -o addr show 2>/dev/null || true)"
+    if command -v ip >/dev/null && ! grep -qF " inet $EXIT_IP/" <<<"$addrs"; then
         warn "本机网卡上没有 $EXIT_IP：确认这是本机的内网 IP（ip -4 addr 查看）"
         return 1
     fi
