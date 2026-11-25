@@ -8,3 +8,7 @@ nginx/conf.d/00-decoy.conf
 nginx/removed/
 certs/
 logs/
+
+# 业务应用各自独立管理 git，主仓库只保留伪装站 decoy
+apps/*
+!apps/decoy/

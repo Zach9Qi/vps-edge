@@ -220,6 +220,16 @@ edge 会依次：从 3001 开始找一个空闲端口 → 按这个端口构建�
 
 应用和端口的对应关系记在 `nginx/conf.d/<域名>.conf` 的第一行（`# app=blog`）和 `proxy_pass` 里，不要删这一行。`apps/` 下的 compose 不要手动 `docker compose up`（拿不到 `APP_PORT`），统一用 `edge up`。
 
+**每个应用单独用 git 管理**：主仓库的 `.gitignore` 忽略了 `apps/` 下除 `decoy` 以外的所有目录，业务应用各自一个仓库，直接 clone 到 `apps/` 下即可：
+
+```bash
+cd /opt/edge/apps && git clone <blog 仓库地址> blog
+edge add blog.example.com blog           # 首次发布
+cd /opt/edge/apps/blog && git pull && edge up blog   # 以后更新
+```
+
+迁移机器时如果只 clone 了主仓库，记得把这些应用也重新 clone 回 `apps/`（直接拷贝整个 `/opt/edge` 则不受影响）。
+
 ### 5.2 反代到已经在运行的服务
 
 ```bash
