@@ -63,6 +63,8 @@ load_keys() {
 render_text() {
     local tpl="$1" content v
     shift
+    # $(<文件) 读不到文件时只打印错误、不算失败，会悄悄渲染出空内容，所以先检查
+    [ -f "$tpl" ] || die "找不到模板 $tpl（项目文件不完整？）"
     content="$(<"$tpl")"
     for v in "$@"; do
         content="${content//"__${v}__"/"${!v}"}"
@@ -374,13 +376,23 @@ xray_exists() {  # xray 容器存在（不管是否在运行）
     docker ps -a --format '{{.Names}}' 2>/dev/null | grep -qx xray
 }
 
-# ================================================================ 链式代理
+# ================================================================ 账号 / 出口 / 内网入口
 # 术语：
-#   上游（UPSTREAM）  本机把代理流量全部转给它，由它出网；本机不直连任何目标网站
-#   通行证（relay）   本机发给别的机器（入口机）的独立凭据，入口机拿它把本机当上游
-#   内网入口          给同一内网里的入口机用的 Shadowsocks 2022 入口，只监听内网 IP
+#   账号      一个独立凭据 = 一条链接。手机用、发给别的设备用、给入口机当上游用，都是账号
+#             每个账号指定一个出口，各走各的，互不影响
+#   出口      账号的流量从哪出去：direct = 本机直接出网；其他 = 一条链接（另一台机器、第三方代理）
+#   内网入口  给同一内网里的入口机用的 Shadowsocks 2022 入口，只监听内网 IP
+#
+# 账号（xray/users.env）：每行 "名字 UUID SS密钥 创建日期 出口"
+#   UUID 给公网入口（VLESS + REALITY）用，SS密钥 给内网入口（Shadowsocks 2022 多用户）用
+#   完整节点自带账号 default（手机用的那条链接，edge client 显示的就是它），不能删除，也不进内网入口
+# 出口（xray/exits.env）：每行 "名字 链接"，支持的链接见 upstream_parse
+USERS_FILE="$EDGE_DIR/xray/users.env"
+EXITS_FILE="$EDGE_DIR/xray/exits.env"
+# 旧版数据，只在迁移时读（见 chain_migrate）
 RELAYS_FILE="$EDGE_DIR/xray/relays.env"
-RELAY_NAME_RE='^[A-Za-z0-9_-]{1,32}$'
+UPSTREAM_MIGRATED="$EDGE_DIR/xray/upstream.migrated"
+NAME_RE='^[A-Za-z0-9_-]{1,32}$'
 SS_METHOD="2022-blake3-aes-128-gcm"
 # 测出口 IP 用：Cloudflare 的 trace 页面，返回内容里有一行 ip=<访问者 IP>
 TRACE_URL="https://www.cloudflare.com/cdn-cgi/trace"
@@ -482,28 +494,208 @@ exit_listen_check() {
     fi
 }
 
-# ---------------------------------------------------------------- 通行证（xray/relays.env）
-# 每行一张：名字 UUID SS密钥 发放日期
-#   UUID   用于公网入口（VLESS + REALITY）
-#   SS密钥 用于内网入口（Shadowsocks 2022 多用户）
-relays_load() {  # 读到数组 RELAY_NAMES / RELAY_UUIDS / RELAY_SSKEYS / RELAY_DATES
-    local n u k d
-    RELAY_NAMES=() RELAY_UUIDS=() RELAY_SSKEYS=() RELAY_DATES=()
-    [ -f "$RELAYS_FILE" ] || return 0
-    while read -r n u k d; do
+# ---------------------------------------------------------------- 账号（xray/users.env）
+users_load() {  # 读到数组 USER_NAMES / USER_UUIDS / USER_SSKEYS / USER_DATES / USER_EXITS
+    local n u k d e rest
+    chain_migrate
+    USER_NAMES=() USER_UUIDS=() USER_SSKEYS=() USER_DATES=() USER_EXITS=()
+    [ -f "$USERS_FILE" ] || return 0
+    while read -r n u k d e rest; do
         if [ -z "$n" ] || [[ "$n" == \#* ]]; then continue; fi
-        [[ "$n" =~ $RELAY_NAME_RE && "$u" =~ ^[0-9a-fA-F-]{36}$ && "$k" =~ ^[A-Za-z0-9+/=]{24}$ ]] \
-            || die "$RELAYS_FILE 里这一行格式不对：$n（应为：名字 UUID SS密钥 日期）"
-        RELAY_NAMES+=("$n") RELAY_UUIDS+=("$u") RELAY_SSKEYS+=("$k") RELAY_DATES+=("${d:--}")
-    done < <(sed 's/\r$//' "$RELAYS_FILE")
+        [[ "$n" =~ $NAME_RE && "$u" =~ ^[0-9a-fA-F-]{36}$ && "$k" =~ ^[A-Za-z0-9+/=]{24}$ && "$e" =~ $NAME_RE ]] \
+            || die "$USERS_FILE 里这一行格式不对：$n（应为：名字 UUID SS密钥 日期 出口）"
+        if user_index "$n" >/dev/null; then die "$USERS_FILE 里有重名的账号：$n"; fi
+        USER_NAMES+=("$n") USER_UUIDS+=("$u") USER_SSKEYS+=("$k") USER_DATES+=("$d") USER_EXITS+=("$e")
+    done < <(sed 's/\r$//' "$USERS_FILE")
 }
 
-relay_index() {  # relay_index <名字>：输出它在数组里的下标；没有返回 1（先 relays_load）
+user_index() {  # user_index <名字>：输出它在数组里的下标；没有返回 1（先 users_load）
     local i
-    for i in "${!RELAY_NAMES[@]}"; do
-        if [ "${RELAY_NAMES[$i]}" = "$1" ]; then echo "$i"; return 0; fi
+    for i in "${!USER_NAMES[@]}"; do
+        if [ "${USER_NAMES[$i]}" = "$1" ]; then echo "$i"; return 0; fi
     done
     return 1
+}
+
+users_save() {  # 把数组写回 users.env（先写临时文件再改名，写到一半出错不会留下半个文件）
+    local i tmp
+    tmp="$(mktemp "$USERS_FILE.XXXXXX")"
+    {
+        echo "# 账号，由 edge user 维护，不要改格式"
+        echo "# 名字 UUID SS密钥 创建日期 出口（direct = 本机直接出网，其他 = exits.env 里的出口名）"
+        for i in "${!USER_NAMES[@]}"; do
+            printf '%s %s %s %s %s\n' "${USER_NAMES[$i]}" "${USER_UUIDS[$i]}" "${USER_SSKEYS[$i]}" \
+                "${USER_DATES[$i]}" "${USER_EXITS[$i]}"
+        done
+    } >"$tmp"
+    chmod 600 "$tmp"
+    mv -f "$tmp" "$USERS_FILE"
+}
+
+user_email() { printf '%s@edge' "$1"; }   # Xray 里账号的标识：日志、路由规则都用它
+
+users_of() {  # users_of <出口>：走这个出口的账号，输出 JSON 数组的内容 "a@edge", "b@edge"；没有输出空
+    local i out=""
+    for i in "${!USER_NAMES[@]}"; do
+        if [ "${USER_EXITS[$i]}" = "$1" ]; then out+="${out:+, }\"$(user_email "${USER_NAMES[$i]}")\""; fi
+    done
+    printf '%s' "$out"
+}
+
+internal_users() {  # 能用内网入口的账号数（default 不进内网入口）
+    local n i
+    n=0
+    for i in "${!USER_NAMES[@]}"; do
+        if [ "${USER_NAMES[$i]}" != default ]; then n=$((n + 1)); fi
+    done
+    echo "$n"
+}
+
+# ---------------------------------------------------------------- 出口（xray/exits.env）
+exits_load() {  # 读到数组 OUT_NAMES / OUT_LINKS
+    local n l rest
+    OUT_NAMES=() OUT_LINKS=()
+    [ -f "$EXITS_FILE" ] || return 0
+    while read -r n l rest; do
+        if [ -z "$n" ] || [[ "$n" == \#* ]]; then continue; fi
+        [[ "$n" =~ $NAME_RE ]] && [ -n "$l" ] && [ -z "$rest" ] \
+            || die "$EXITS_FILE 里这一行格式不对：$n（应为：名字 链接）"
+        case "$n" in direct|block) die "$EXITS_FILE 里的出口不能叫 $n（保留名字）" ;; esac
+        if out_index "$n" >/dev/null; then die "$EXITS_FILE 里有重名的出口：$n"; fi
+        OUT_NAMES+=("$n") OUT_LINKS+=("$l")
+    done < <(sed 's/\r$//' "$EXITS_FILE")
+}
+
+out_index() {  # out_index <名字>：输出出口在数组里的下标；没有返回 1（先 exits_load）
+    local i
+    for i in "${!OUT_NAMES[@]}"; do
+        if [ "${OUT_NAMES[$i]}" = "$1" ]; then echo "$i"; return 0; fi
+    done
+    return 1
+}
+
+exit_known() {  # exit_known <名字>：direct 或者 exits.env 里有这个出口
+    [ "$1" = direct ] || out_index "$1" >/dev/null
+}
+
+exits_save() {
+    local i tmp
+    tmp="$(mktemp "$EXITS_FILE.XXXXXX")"
+    {
+        echo "# 出口，由 edge exit 维护，不要改格式"
+        echo "# 名字 链接"
+        for i in "${!OUT_NAMES[@]}"; do
+            printf '%s %s\n' "${OUT_NAMES[$i]}" "${OUT_LINKS[$i]}"
+        done
+    } >"$tmp"
+    chmod 600 "$tmp"
+    mv -f "$tmp" "$EXITS_FILE"
+}
+
+exit_desc() {  # exit_desc <出口>：给人看的简介（不含密码；先 exits_load）
+    local i
+    if [ "$1" = direct ]; then echo "本机直接出网"; return 0; fi
+    if ! i="$(out_index "$1")"; then echo "（出口不存在）"; return 0; fi
+    if upstream_parse "${OUT_LINKS[$i]}" 2>/dev/null; then echo "$UP_DESC"; else echo "（链接有问题）"; fi
+}
+
+# ---------------------------------------------------------------- 旧版数据迁移
+# chain_migrate：users.env 还不存在时，把旧版数据迁移过来（只做一次，UUID 和密钥原样保留，客户端不用重新导入）
+#   keys.env 的 XRAY_UUID → 账号 default（只有完整节点）
+#   relays.env 的每张通行证 → 同名账号
+#   .env 的 UPSTREAM      → 出口 upstream，所有账号都走它（和旧版"本机流量全部经上游"一样）
+# 不改 .env 和 relays.env：02-init.sh 生效成功后再清理（UPSTREAM 清空、relays.env 改名）
+chain_migrate() {
+    [ ! -f "$USERS_FILE" ] && [ -f "$KEYS_FILE" ] || return 0
+    local out=direct n u k d rest i uuid
+    if [ -n "${UPSTREAM:-}" ]; then
+        upstream_parse "$UPSTREAM" \
+            || die ".env 里 UPSTREAM 的链接不对（原因见上），没法迁移成出口：改对之后重新运行，或者清空 UPSTREAM 的值"
+        exits_load
+        if i="$(out_index upstream)"; then
+            [ "${OUT_LINKS[$i]}" = "$UPSTREAM" ] \
+                || die "$EXITS_FILE 里已经有出口 upstream，但链接和 .env 的 UPSTREAM 不一样：确认用哪个之后删掉另一个"
+        else
+            OUT_NAMES+=(upstream) OUT_LINKS+=("$UPSTREAM")
+            exits_save
+        fi
+        out=upstream
+        : >"$UPSTREAM_MIGRATED"   # 02-init.sh 看到它才会清空 .env 的 UPSTREAM
+    fi
+
+    USER_NAMES=() USER_UUIDS=() USER_SSKEYS=() USER_DATES=() USER_EXITS=()
+    if [ "${EDGE_ROLE:-edge}" = edge ]; then
+        uuid="$( . <(sed 's/\r$//' "$KEYS_FILE"); printf '%s' "${XRAY_UUID:-}")"
+        [[ "$uuid" =~ ^[0-9a-fA-F-]{36}$ ]] || uuid="$(gen_uuid)"
+        USER_NAMES+=(default) USER_UUIDS+=("$uuid") USER_SSKEYS+=("$(gen_ss_key)")
+        USER_DATES+=("$(date +%F)") USER_EXITS+=("$out")
+    fi
+    if [ -f "$RELAYS_FILE" ]; then
+        while read -r n u k d rest; do
+            if [ -z "$n" ] || [[ "$n" == \#* ]]; then continue; fi
+            [[ "$n" =~ $NAME_RE && "$u" =~ ^[0-9a-fA-F-]{36}$ && "$k" =~ ^[A-Za-z0-9+/=]{24}$ ]] \
+                || die "$RELAYS_FILE 里这一行格式不对：$n（应为：名字 UUID SS密钥 日期）"
+            if [ "$n" = default ]; then n=relay-default; fi
+            if user_index "$n" >/dev/null; then die "迁移失败：$RELAYS_FILE 里有重名的通行证 $n"; fi
+            USER_NAMES+=("$n") USER_UUIDS+=("$u") USER_SSKEYS+=("$k") USER_DATES+=("${d:--}") USER_EXITS+=("$out")
+        done < <(sed 's/\r$//' "$RELAYS_FILE")
+    fi
+    users_save
+    # 输出到 stderr：调用方可能在 $(...) 里，不能混进返回值
+    log "已建立账号列表 $USERS_FILE（${#USER_NAMES[@]} 个账号；原有的 UUID 和密钥不变，客户端不用重新导入）" >&2
+    if [ "$out" != direct ]; then
+        log "旧版的上游已迁移为出口 upstream，所有账号都走它（和以前一样）" >&2
+    fi
+}
+
+# ---------------------------------------------------------------- 按账号生成出口和路由
+# xray_egress：根据账号和出口生成 Xray 的 outbounds 和 routing（先 users_load、exits_load）
+# 设置 EGRESS_OUTBOUNDS / EGRESS_RULES / EGRESS_DOMAIN_STRATEGY，填进 templates/xray/egress.json.tpl
+#
+# 严格按账号走，没有任何回落：
+#   - 第一个出口是 block：没匹配到任何规则的连接（Xray 默认用第一个出口）一律丢弃，不会掉进 direct
+#   - 至少有一个账号走 direct 时才生成 freedom；所有账号都走出口时，配置里根本没有直连这条路
+#   - 账号指向的出口不存在、链接看不懂、指向本机 → 报错，不生成
+#   - 不生成 balancer / observatory：出口连不上就是连不上，Xray 不会换别的出口
+# 拦截规则：
+#   - bittorrent：所有账号都拦（只看协议嗅探的结果，不查 DNS）
+#   - geoip:private：只拦走 direct 的账号，防止经本机访问 127.0.0.1 上的服务、所在内网、云厂商元数据接口
+#     走出口的账号不加 IP 规则：Xray 判断一条规则时 user 条件在 ip 条件之前，不满足就不再往下看；
+#     IPOnDemand 只在真正判断 ip 条件时才查 DNS。所以走出口的账号不会在本机查 DNS，
+#     内网地址交给真正出网的那一跳去拦
+xray_egress() {
+    local i users tag directs
+    for i in "${!USER_NAMES[@]}"; do
+        exit_known "${USER_EXITS[$i]}" \
+            || die "账号 ${USER_NAMES[$i]} 的出口 ${USER_EXITS[$i]} 不存在（edge exit list 查看；edge user set-exit ${USER_NAMES[$i]} <出口> 修改）"
+    done
+
+    EGRESS_OUTBOUNDS="    { \"tag\": \"block\", \"protocol\": \"blackhole\" }"
+    EGRESS_RULES="      { \"type\": \"field\", \"protocol\": [\"bittorrent\"], \"outboundTag\": \"block\" }"
+    EGRESS_DOMAIN_STRATEGY=AsIs
+
+    directs="$(users_of direct)"
+    if [ -n "$directs" ]; then
+        EGRESS_OUTBOUNDS+=$',\n'"    { \"tag\": \"direct\", \"protocol\": \"freedom\" }"
+        EGRESS_RULES+=$',\n'"      { \"type\": \"field\", \"user\": [ $directs ], \"ip\": [\"geoip:private\"], \"outboundTag\": \"block\" }"
+        EGRESS_RULES+=$',\n'"      { \"type\": \"field\", \"user\": [ $directs ], \"outboundTag\": \"direct\" }"
+        EGRESS_DOMAIN_STRATEGY=IPOnDemand
+    fi
+
+    for i in "${!OUT_NAMES[@]}"; do
+        users="$(users_of "${OUT_NAMES[$i]}")"
+        [ -n "$users" ] || continue          # 没有账号用的出口不放进配置
+        tag="exit-${OUT_NAMES[$i]}"
+        upstream_parse "${OUT_LINKS[$i]}" "$tag" \
+            || die "出口 ${OUT_NAMES[$i]} 的链接看不懂（原因见上）：edge exit update ${OUT_NAMES[$i]} '<链接>' 重新设置"
+        if { [ -n "${REALITY_SNI:-}" ] && [ "$UP_HOST" = "$REALITY_SNI" ]; } \
+           || { [ -n "${EXIT_IP:-}" ] && [ "$UP_HOST" = "$EXIT_IP" ]; }; then
+            die "出口 ${OUT_NAMES[$i]} 指向的是本机（$UP_HOST）：出口必须是另一台机器"
+        fi
+        [ -z "$UP_WARN" ] || [ "${EDGE_EXIT_WARNED:-0}" = 1 ] || warn "出口 ${OUT_NAMES[$i]}：$UP_WARN"
+        EGRESS_OUTBOUNDS+=$',\n'"$UP_OUTBOUND"
+        EGRESS_RULES+=$',\n'"      { \"type\": \"field\", \"user\": [ $users ], \"outboundTag\": \"$tag\" }"
+    done
 }
 
 # ---------------------------------------------------------------- 分享链接
@@ -561,13 +753,13 @@ _json_list() {  # _json_list <逗号分隔的值>：输出 JSON 数组的内容 
     printf '%s' "$out"
 }
 
-# upstream_parse <链接>：解析上游链接。成功时设置：
-#   UP_OUTBOUND  Xray 出口配置（JSON，tag 为 upstream）
+# upstream_parse <链接> [tag]：解析出口（上游）链接。成功时设置：
+#   UP_OUTBOUND  Xray 出口配置（JSON，tag 默认为 upstream）
 #   UP_HOST / UP_PORT 上游地址；UP_DESC 简介（不含密码）；UP_WARN 需要提醒的事（可能为空）
 # 支持：vless://（reality / tls / none；raw、ws、grpc、xhttp、httpupgrade）、ss://、socks5://、http://、https://
 # 看不懂时打印原因、返回 1
 upstream_parse() {
-    local link="$1" scheme rest query userinfo hostport
+    local link="$1" tag="${2:-upstream}" scheme rest query userinfo hostport
     local id enc flow sec net sni fp pbk sid spx pqv alpn host path svc mode users stream tls trans ui method pw dec
     UP_OUTBOUND="" UP_HOST="" UP_PORT="" UP_DESC="" UP_WARN=""
 
@@ -647,7 +839,7 @@ upstream_parse() {
         [ -z "$tls" ] || stream+=", $tls"
         [ -z "$trans" ] || stream+=", $trans"
         UP_OUTBOUND="    {
-      \"tag\": \"upstream\",
+      \"tag\": $(json_str "$tag"),
       \"protocol\": \"vless\",
       \"settings\": {
         \"vnext\": [ { \"address\": $(json_str "$UP_HOST"), \"port\": $UP_PORT, \"users\": [ $users ] } ]
@@ -677,7 +869,7 @@ upstream_parse() {
         esac
         [ -n "$pw" ] || { warn "ss 链接里没有密码"; return 1; }
         UP_OUTBOUND="    {
-      \"tag\": \"upstream\",
+      \"tag\": $(json_str "$tag"),
       \"protocol\": \"shadowsocks\",
       \"settings\": {
         \"servers\": [ { \"address\": $(json_str "$UP_HOST"), \"port\": $UP_PORT, \"method\": $(json_str "$method"), \"password\": $(json_str "$pw") } ]
@@ -707,7 +899,7 @@ upstream_parse() {
       \"streamSettings\": { \"security\": \"tls\", \"tlsSettings\": { \"serverName\": $(json_str "${sni:-$UP_HOST}") } }"
         fi
         UP_OUTBOUND="    {
-      \"tag\": \"upstream\",
+      \"tag\": $(json_str "$tag"),
       \"protocol\": \"$method\",
       \"settings\": {
         \"servers\": [ { \"address\": $(json_str "$UP_HOST"), \"port\": $UP_PORT$users } ]
@@ -728,17 +920,20 @@ upstream_mask() {
     printf '%s' "$l" | sed -E 's/((pbk|sid|pqv)=)[^&#]*/\1******/g'
 }
 
-# upstream_probe <链接>：临时起一个 Xray 容器，经这个上游访问外网
-# 确认：能连上、能出网、出口 IP 不是本机。不影响正在运行的 xray。通过返回 0
+# upstream_probe <链接> [local]：临时起一个 Xray 容器，经这条链接访问外网，不影响正在运行的 xray
+# 确认：能连上、能出网，并且出口 IP 符合预期：
+#   默认   出口 IP 不是本机（测出口 / 上游：流量确实从另一台机器出去）
+#   local  出口 IP 就是本机（测本机走 direct 的账号）
+# 通过返回 0
 upstream_probe() {
-    local link="$1" dir name port i direct4="" direct6="" via="" rc=0 logs=""
+    local link="$1" expect="${2:-remote}" dir name port i direct4="" direct6="" via="" rc=0 logs=""
     upstream_parse "$link" || return 1
 
     # shellcheck disable=SC2016
     if timeout 5 bash -c 'exec 3<>"/dev/tcp/$0/$1"' "$UP_HOST" "$UP_PORT" 2>/dev/null; then
-        log "能连上上游 $UP_HOST:$UP_PORT"
+        log "能连上 $UP_HOST:$UP_PORT"
     else
-        warn "连不上上游 $UP_HOST:$UP_PORT：上游没启动、地址或端口写错，或者被对方的防火墙 / 安全组挡住了"
+        warn "连不上 $UP_HOST:$UP_PORT：对方没启动、地址或端口写错，或者被对方的防火墙 / 安全组挡住了"
         return 1
     fi
 
@@ -769,14 +964,21 @@ upstream_probe() {
     rm -rf "$dir"
 
     if [ -z "$via" ]; then
-        warn "经上游访问外网失败：链接里的密码 / UUID / 公钥不对，或者上游自己出不了网"
+        warn "经 $UP_HOST:$UP_PORT 访问外网失败：链接里的密码 / UUID / 公钥不对，或者它后面的出口不通"
         if [ -n "$logs" ]; then printf '%s\n' "$logs" | sed 's/^/      xray: /' >&2; fi
         rc=1
+    elif [ "$expect" = local ]; then
+        if [ "$via" = "$direct4" ] || [ "$via" = "$direct6" ]; then
+            log "出口 IP：$via，就是本机，符合预期（direct）"
+        else
+            warn "出口 IP（$via）不是本机（${direct4:-${direct6:-未知}}），和预期的 direct 不一致"
+            rc=1
+        fi
     elif [ "$via" = "$direct4" ] || [ "$via" = "$direct6" ]; then
-        warn "出口 IP（$via）和本机一样：流量没有走上游"
+        warn "出口 IP（$via）和本机一样：流量没有走到另一台机器"
         rc=1
     else
-        log "出口 IP：$via（本机：${direct4:-${direct6:-未知}}），流量确实从上游出去"
+        log "出口 IP：$via（本机：${direct4:-${direct6:-未知}}），流量确实从另一台机器出去"
     fi
     return "$rc"
 }

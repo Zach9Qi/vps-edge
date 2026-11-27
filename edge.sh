@@ -19,19 +19,23 @@
 #   edge logs [nginx|xray]   查看日志
 #   edge xray [--raw]        查看 Xray 实际配置（私钥默认隐藏，--raw 显示完整）
 #
-#   ---- 链式代理（多台机器串联，详见 README 第 8 节）----
-#   edge chain                       打开链式代理菜单
-#   edge upstream                    查看本机的上游
-#   edge upstream '<链接>' [--force]  设置上游：先测试，通过后才启用；本机流量全部经上游出去
-#   edge upstream test               测试当前上游（能否连通、出口 IP 是不是上游的）
-#   edge upstream off                取消上游，恢复直接出网
-#   edge relay add <名字>            给入口机发一张通行证，打印链接（入口机拿去 edge upstream）
-#   edge relay list                  查看已发的通行证
-#   edge relay show <名字>           再次显示某张通行证的链接
-#   edge relay remove <名字>         吊销通行证（对应入口机立刻连不上，其他不受影响）
-#   edge internal                    查看 / 交互设置内网入口
-#   edge internal <内网IP:端口>       开启或修改内网入口（给同一内网的入口机用）
-#   edge internal off                关闭内网入口
+#   ---- 账号和出口（多账号、链式代理，详见 README 第 8 节）----
+#   每个账号一条链接，各走各的出口：direct = 本机直接出网，或者另一台机器 / 第三方代理
+#   edge chain                                  打开账号 / 出口菜单
+#   edge user add <名字> [--exit <出口>]         新建账号，打印链接（手机用，或者给入口机当出口）
+#   edge user list                              查看账号和各自的出口
+#   edge user show <名字>                        再次显示链接
+#   edge user set-exit <名字> <出口>              修改账号的出口（链接不变）
+#   edge user test <名字>                        测试：流量是不是从该走的出口出去
+#   edge user remove <名字>                      删除账号（用它的设备立刻连不上，其他不受影响）
+#   edge exit add <名字> '<链接>' [--force]       添加出口：先测试，通过才保存
+#   edge exit update <名字> '<链接>' [--force]    更换出口的链接
+#   edge exit list | test <名字> | remove <名字>   查看 / 测试 / 删除出口（还有账号在用时不能删）
+#   edge upstream '<链接>' | test | off          旧命令：所有账号都走出口 upstream / 测试 / 取消
+#   edge relay ...                              旧命令：同 edge user
+#   edge internal                               查看 / 交互设置内网入口
+#   edge internal <内网IP:端口>                  开启或修改内网入口（给同一内网的入口机用）
+#   edge internal off                           关闭内网入口
 SELF="$(readlink -f "${BASH_SOURCE[0]}")"
 . "$(dirname "$SELF")/scripts/lib.sh"
 S="$EDGE_DIR/scripts"
@@ -215,7 +219,7 @@ wizard_exit() {
 ================ 内网出口配置 ================
 这台机器只给同一内网里的入口机当出口：
   - 不需要域名、证书、Cloudflare，不对公网开放任何端口
-  - 只在内网 IP 上开一个 Shadowsocks 2022 入口，入口机凭"通行证"连进来
+  - 只在内网 IP 上开一个 Shadowsocks 2022 入口，入口机凭本机发的账号连进来
 EOF
     pick_internal addr
     env_set EXIT_LISTEN "$addr"
@@ -350,7 +354,7 @@ cmd_install() {
     bash "$S/show-client.sh"
     echo
     log "安装完成。以后只需要记一个命令：edge（打开菜单），或 edge help 查看所有用法"
-    log "要和别的机器串联（链式代理）：edge chain"
+    log "多账号、和别的机器串联（链式代理）：edge chain"
 }
 
 # install_exit：出口模式的安装后半段（不需要证书、nginx、伪装站）
@@ -370,14 +374,14 @@ install_exit() {
     bash "$S/check.sh" || warn "有检查项没通过，按上面的提示处理后再运行 edge check"
     echo
     log "安装完成（内网出口模式）。以后只需要记一个命令：edge（打开菜单）"
-    relays_load
-    if [ ${#RELAY_NAMES[@]} -eq 0 ] && [ -t 0 ]; then
+    users_load
+    if [ ${#USER_NAMES[@]} -eq 0 ] && [ -t 0 ]; then
         echo
-        if confirm "现在给入口机发一张通行证吗？"; then
-            ask name "通行证名字（字母、数字、- _，比如入口机的名字 A01）" "A01"
-            bash "$SELF" relay add "$name" || true
+        if confirm "现在给入口机建一个账号吗？"; then
+            ask name "账号名字（字母、数字、- _，比如入口机的名字 A01）" "A01"
+            bash "$SELF" user add "$name" || true
         else
-            log "以后需要时运行：edge relay add <名字>"
+            log "以后需要时运行：edge user add <名字>"
         fi
     fi
 }
@@ -559,17 +563,15 @@ cmd_update() {
 
 cmd_rotate() {
     load_env
-    relays_load
+    need_installed
+    users_load
     if [ -t 0 ]; then
-        if [ ${#RELAY_NAMES[@]} -gt 0 ]; then
-            warn "已发出 ${#RELAY_NAMES[@]} 张通行证（${RELAY_NAMES[*]}）：轮换后它们的链接也会失效，要在每台入口机上重新 edge upstream"
-        fi
+        warn "轮换会换掉 REALITY 密钥、内网入口密钥和所有账号的 UUID：${#USER_NAMES[@]} 个账号（${USER_NAMES[*]}）的链接全部失效"
+        warn "给入口机当出口的账号，要到对应的入口机上 edge exit update <出口名> '<新链接>'"
         confirm "轮换后所有客户端都要重新导入，确定？" || { log "已取消"; return 0; }
     fi
     bash "$S/02-init.sh" --rotate-keys
-    if [ ${#RELAY_NAMES[@]} -gt 0 ]; then
-        log "通行证的新链接：edge relay show <名字>（${RELAY_NAMES[*]}），再到对应的入口机上 edge upstream '<新链接>'"
-    fi
+    log "新链接：edge client（default），其他账号 edge user show <名字>"
 }
 
 # cmd_xray [--raw]：查看 Xray 正在用的配置（容器挂载的就是这个文件），私钥和密码默认打码
@@ -605,211 +607,538 @@ cmd_logs() {
     esac
 }
 
-# ================================================================ 链式代理
-# 重新生成配置并生效（不打印客户端配置）
-apply_quiet() { EDGE_ONECLICK=1 bash "$S/02-init.sh"; }
+# ================================================================ 账号 / 出口 / 内网入口
+# 数据和路由规则见 scripts/lib.sh 的"账号 / 出口 / 内网入口"一节和 xray_egress
+#
+# 重新生成配置并生效（不打印客户端配置；出口的明文提醒在添加出口时已经说过）
+apply_quiet() { EDGE_ONECLICK=1 EDGE_EXIT_WARNED=1 bash "$S/02-init.sh"; }
 
 need_installed() {
     [ -f "$KEYS_FILE" ] || die "还没有安装：先运行 edge install"
 }
 
-# ---------------------------------------------------------------- 上游
-upstream_status() {
-    if [ -z "$UPSTREAM" ]; then
-        log "本机没有设置上游：代理流量直接从本机出网"
-        echo "  设置上游：edge upstream '<链接>'"
-        return 0
-    fi
-    if upstream_parse "$UPSTREAM"; then
-        log "上游：$UP_DESC（本机的代理流量全部经它出去）"
-        echo "  链接：$(upstream_mask "$UPSTREAM")"
-        [ -z "$UP_WARN" ] || warn "$UP_WARN"
-        echo "  测试：edge upstream test    取消：edge upstream off"
-    else
-        warn ".env 里的 UPSTREAM 看不懂（原因见上）：edge upstream '<链接>' 重新设置，或 edge upstream off 取消"
-    fi
-}
-
-upstream_set() {  # upstream_set <链接> <force 0|1>
-    local link="$1" force="$2" old
-    upstream_parse "$link" || die "这个链接用不了（原因见上）"
-    if [ "$EDGE_ROLE" = edge ] && [ "$UP_HOST" = "$REALITY_SNI" ]; then
-        die "这是本机自己的链接：上游必须是另一台机器"
-    fi
-    log "上游：$UP_DESC"
-    [ -z "$UP_WARN" ] || warn "$UP_WARN"
-    log "先测试一下（临时启动一个测试用的 Xray，不影响正在运行的服务）"
-    if ! upstream_probe "$link"; then
-        if [ "$force" = 1 ]; then
-            warn "测试没通过，按 --force 仍然启用"
-        elif [ -t 0 ]; then
-            confirm "测试没通过，仍然保存并启用吗？（启用后代理流量全部走这个上游，上游不通就上不了网）" \
-                || die "已取消，配置没有改动"
-        else
-            die "测试没通过，配置没有改动（确定要启用：edge upstream '<链接>' --force）"
-        fi
-    fi
-    old="$(env_get UPSTREAM)"
-    env_set UPSTREAM "'$link'"
-    if ! EDGE_UPSTREAM_WARNED=1 apply_quiet; then
-        if [ -n "$old" ]; then env_set UPSTREAM "'$old'"; else env_set UPSTREAM ""; fi
-        die "启用失败，已恢复原来的设置（原因见上）"
-    fi
-    log "已启用上游：本机的代理流量全部经 $UP_ADDR 出去，本机不再直连任何网站"
-    echo "  手机等客户端的配置不用改，照常连本机"
-}
-
-cmd_upstream() {
-    load_env
-    need_installed
-    local a link="" force=0 old
-    for a in "$@"; do
-        if [ "$a" = --force ]; then force=1; else link="$a"; fi
+# 改账号 / 出口之前先备份；重新生成配置失败时恢复原样（02-init.sh 自己会恢复 config.json）
+chain_backup() {
+    local f
+    CHAIN_BAK="$(mktemp -d)"
+    for f in "$USERS_FILE" "$EXITS_FILE"; do
+        if [ -f "$f" ]; then cp -p "$f" "$CHAIN_BAK/"; fi
     done
-    case "$link" in
-        "")
-            upstream_status ;;
-        test)
-            [ -n "$UPSTREAM" ] || die "本机没有设置上游"
-            log "测试上游（临时启动一个测试用的 Xray，不影响正在运行的服务）"
-            upstream_probe "$UPSTREAM" || die "上游测试没通过（原因见上）"
-            log "上游测试通过" ;;
-        off)
-            if [ -z "$UPSTREAM" ]; then log "本机本来就没有设置上游"; return 0; fi
-            old="$UPSTREAM"
-            env_set UPSTREAM ""
-            if ! apply_quiet; then env_set UPSTREAM "'$old'"; die "取消失败，已恢复原来的设置（原因见上）"; fi
-            log "已取消上游：代理流量恢复直接从本机出网" ;;
-        *)
-            upstream_set "$link" "$force" ;;
-    esac
 }
 
-# ---------------------------------------------------------------- 通行证
-relays_backup() {
-    RELAYS_BAK="$(mktemp)" RELAYS_HAD=0
-    if [ -f "$RELAYS_FILE" ]; then cp -p "$RELAYS_FILE" "$RELAYS_BAK"; RELAYS_HAD=1; fi
+chain_restore() {
+    local f b
+    for f in "$USERS_FILE" "$EXITS_FILE"; do
+        b="$CHAIN_BAK/$(basename "$f")"
+        if [ -f "$b" ]; then cat "$b" >"$f"; else rm -f "$f"; fi
+    done
+    rm -rf "$CHAIN_BAK"
 }
 
-relays_restore() {
-    if [ "$RELAYS_HAD" = 1 ]; then cat "$RELAYS_BAK" >"$RELAYS_FILE"; else rm -f "$RELAYS_FILE"; fi
-    rm -f "$RELAYS_BAK"
+chain_apply() {  # chain_apply <失败时的说明>：重新生成配置并生效；失败就恢复账号和出口，然后退出
+    if ! apply_quiet; then
+        chain_restore
+        die "$1，已恢复原来的设置（原因见上）"
+    fi
+    rm -rf "$CHAIN_BAK"
 }
 
-relay_print() {  # relay_print <名字>：打印这张通行证的链接
-    local name="$1" i
-    relays_load
-    i="$(relay_index "$name")" || die "没有叫 $name 的通行证（edge relay list 查看）"
+link_name() {  # link_name <账号>：分享链接里显示的节点名
+    if [ "$1" = default ]; then printf '%s' "$NODE_NAME"; else printf '%s-%s' "$NODE_NAME" "$1"; fi
+}
+
+users_using() {  # users_using <出口>：走这个出口的账号名，空格分隔（先 users_load）
+    local i out=""
+    for i in "${!USER_NAMES[@]}"; do
+        if [ "${USER_EXITS[$i]}" = "$1" ]; then out+="${out:+ }${USER_NAMES[$i]}"; fi
+    done
+    printf '%s' "$out"
+}
+
+suggest_exit() {  # 新账号默认的出口：和 default 一样；没有 default 时和第一个账号一样；都没有就 direct
+    local i
+    if i="$(user_index default)"; then
+        echo "${USER_EXITS[$i]}"
+    elif [ ${#USER_EXITS[@]} -gt 0 ]; then
+        echo "${USER_EXITS[0]}"
+    else
+        echo direct
+    fi
+}
+
+# pick_user <变量名> <提示>：列出账号，按序号选
+pick_user() {
+    local __v="$1" __p="$2" __i __n
+    [ ${#USER_NAMES[@]} -gt 0 ] || die "还没有账号：edge user add <名字>"
+    for __i in "${!USER_NAMES[@]}"; do
+        printf '  %d) %-20s → %s\n' $((__i + 1)) "${USER_NAMES[$__i]}" "${USER_EXITS[$__i]}"
+    done
+    read -rp "$__p（序号）: " __n
+    [[ "$__n" =~ ^[0-9]+$ ]] && [ "$__n" -ge 1 ] && [ "$__n" -le ${#USER_NAMES[@]} ] || die "序号不对"
+    printf -v "$__v" '%s' "${USER_NAMES[$((__n - 1))]}"
+}
+
+# pick_exit_name <变量名> <提示>：列出出口（不含 direct），按序号选
+pick_exit_name() {
+    local __v="$1" __p="$2" __i __n
+    [ ${#OUT_NAMES[@]} -gt 0 ] || die "还没有出口：edge exit add <名字> '<链接>'"
+    for __i in "${!OUT_NAMES[@]}"; do
+        printf '  %d) %-16s %s\n' $((__i + 1)) "${OUT_NAMES[$__i]}" "$(exit_desc "${OUT_NAMES[$__i]}")"
+    done
+    read -rp "$__p（序号）: " __n
+    [[ "$__n" =~ ^[0-9]+$ ]] && [ "$__n" -ge 1 ] && [ "$__n" -le ${#OUT_NAMES[@]} ] || die "序号不对"
+    printf -v "$__v" '%s' "${OUT_NAMES[$((__n - 1))]}"
+}
+
+# pick_out <变量名> <提示> [默认]：列出 direct 和所有出口，按序号选
+pick_out() {
+    local __v="$1" __p="$2" __def="${3:-direct}" __list __i __n __d=1 __mark
+    __list=(direct "${OUT_NAMES[@]}")
+    for __i in "${!__list[@]}"; do
+        __mark=""
+        if [ "${__list[$__i]}" = "$__def" ]; then __mark="（默认）"; __d=$((__i + 1)); fi
+        printf '  %d) %-16s %s%s\n' $((__i + 1)) "${__list[$__i]}" "$(exit_desc "${__list[$__i]}")" "$__mark"
+    done
+    while :; do
+        read -rp "$__p（序号）[$__d]: " __n
+        __n="${__n:-$__d}"
+        if [[ "$__n" =~ ^[0-9]+$ ]] && [ "$__n" -ge 1 ] && [ "$__n" -le ${#__list[@]} ]; then break; fi
+        warn "填 1-${#__list[@]} 之间的序号"
+    done
+    printf -v "$__v" '%s' "${__list[$((__n - 1))]}"
+}
+
+# ---------------------------------------------------------------- 账号
+user_print() {  # user_print <名字>：打印账号的链接
+    local name="$1" i out
+    users_load
+    exits_load
+    i="$(user_index "$name")" || die "没有叫 $name 的账号（edge user list 查看）"
     load_keys
+    out="${USER_EXITS[$i]}"
     echo
-    echo "================ 通行证：$name ================"
-    if [ -n "$EXIT_LISTEN" ] && exit_listen_check "$EXIT_LISTEN"; then
-        echo "【和本机在同一内网的入口机用这条】走内网：更快，通常也不计公网流量"
-        ss_link "${RELAY_SSKEYS[$i]}" "relay-$name"; echo
-        echo
-    fi
+    echo "================ 账号：$name ================"
+    echo "出口：$out（$(exit_desc "$out")）"
     if [ "$EDGE_ROLE" = edge ]; then
-        echo "【公网上的入口机用这条】"
-        vless_link "${RELAY_UUIDS[$i]}" "relay-$name"; echo
         echo
+        echo "【公网链接】导入手机、电脑的客户端；或者给公网上的入口机当出口"
+        vless_link "${USER_UUIDS[$i]}" "$(link_name "$name")"; echo
     fi
-    echo "到入口机上运行（链接两边要加单引号）："
-    echo "  edge upstream '<上面的链接>'"
+    if [ "$name" != default ] && [ -n "$EXIT_LISTEN" ] && exit_listen_check "$EXIT_LISTEN"; then
+        echo
+        echo "【内网链接】给和本机在同一内网的入口机当出口：更快，通常也不计公网流量"
+        ss_link "${USER_SSKEYS[$i]}" "$(link_name "$name")"; echo
+    fi
+    if [ "$name" != default ]; then
+        echo
+        echo "给入口机当出口时，到入口机上运行（链接两边要加单引号）："
+        echo "  edge exit add <出口名> '<上面的链接>'"
+    fi
     echo "================================================"
-    echo "链接相当于密码，只发给对应的入口机；不用了在本机运行 edge relay remove $name"
-    if [ "$EDGE_ROLE" = edge ] && [ -z "$EXIT_LISTEN" ]; then
+    echo "链接相当于密码，只发给要用的人或机器；不用了：edge user remove $name"
+    if [ "$EDGE_ROLE" = edge ] && [ -z "$EXIT_LISTEN" ] && [ "$name" != default ]; then
         echo "入口机和本机在同一内网？开启内网入口会更快：edge internal"
     fi
 }
 
-relay_add() {
-    local name="${1:-}"
+user_add() {  # user_add <名字> [--exit <出口>]
+    local name="" out=""
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --exit)   [ $# -ge 2 ] || die "--exit 后面要跟出口名（direct 或 edge exit list 里的名字）"
+                      out="$2"; shift 2 ;;
+            --exit=*) out="${1#--exit=}"; shift ;;
+            -*)       die "不认识的参数：$1（用法：edge user add <名字> [--exit <出口>]）" ;;
+            *)        name="$1"; shift ;;
+        esac
+    done
+    users_load
+    exits_load
     if [ -z "$name" ]; then
-        [ -t 0 ] || die "用法：edge relay add <名字>"
-        ask name "通行证名字（字母、数字、- _，比如入口机的名字 A01）"
+        [ -t 0 ] || die "用法：edge user add <名字> [--exit <出口>]"
+        ask name "账号名字（字母、数字、- _；比如 phone2、work，给入口机用就写入口机的名字）"
     fi
-    [[ "$name" =~ $RELAY_NAME_RE ]] || die "名字只能用字母、数字、- 和 _，最长 32 个字符：$name"
-    relays_load
-    if relay_index "$name" >/dev/null; then
-        die "已经有叫 $name 的通行证了（edge relay show $name 再次显示链接）"
+    [[ "$name" =~ $NAME_RE ]] || die "名字只能用字母、数字、- 和 _，最长 32 个字符：$name"
+    if [ "$name" = default ] && [ "$EDGE_ROLE" = exit ]; then
+        die "default 是完整节点给手机用的保留名字，换一个"
     fi
-    relays_backup
-    if [ ! -f "$RELAYS_FILE" ]; then
-        printf '# 中转通行证，由 edge relay add / remove 维护，不要改格式\n# 名字 UUID SS密钥 发放日期\n' >"$RELAYS_FILE"
+    if user_index "$name" >/dev/null; then die "已经有叫 $name 的账号了（edge user show $name 显示链接）"; fi
+    if [ -z "$out" ]; then
+        if [ -t 0 ]; then
+            echo
+            echo "  $name 的流量从哪个出口出去："
+            pick_out out "选择出口" "$(suggest_exit)"
+        elif [ ${#OUT_NAMES[@]} -eq 0 ]; then
+            out=direct
+        else
+            die "本机有出口（${OUT_NAMES[*]}）：请用 --exit 指定 $name 走哪个出口（direct 或出口名），免得走错"
+        fi
     fi
-    chmod 600 "$RELAYS_FILE"
-    printf '%s %s %s %s\n' "$name" "$(gen_uuid)" "$(gen_ss_key)" "$(date +%F)" >>"$RELAYS_FILE"
-    log "已生成通行证 $name，重新生成配置"
-    if ! apply_quiet; then
-        relays_restore
-        die "发放失败，已撤销（原因见上）"
-    fi
-    rm -f "$RELAYS_BAK"
-    relay_print "$name"
+    exit_known "$out" || die "没有叫 $out 的出口（edge exit list 查看；本机直接出网填 direct）"
+    chain_backup
+    USER_NAMES+=("$name") USER_UUIDS+=("$(gen_uuid)") USER_SSKEYS+=("$(gen_ss_key)")
+    USER_DATES+=("$(date +%F)") USER_EXITS+=("$out")
+    users_save
+    log "已创建账号 $name（出口：$out），重新生成配置"
+    chain_apply "创建失败"
+    user_print "$name"
 }
 
-relay_list() {
-    local i kinds=""
-    relays_load
-    if [ ${#RELAY_NAMES[@]} -eq 0 ]; then
-        log "还没有发过通行证"
-        echo "  发一张：edge relay add <名字>"
+user_list() {
+    local i
+    users_load
+    exits_load
+    if [ ${#USER_NAMES[@]} -eq 0 ]; then
+        log "还没有账号"
+        echo "  创建：edge user add <名字>"
         return 0
     fi
-    if [ -n "$EXIT_LISTEN" ]; then kinds="内网"; fi
-    if [ "$EDGE_ROLE" = edge ]; then kinds="${kinds:+$kinds + }公网"; fi
-    log "已发出 ${#RELAY_NAMES[@]} 张通行证（每张都有：${kinds:-无可用入口} 链接）"
-    for i in "${!RELAY_NAMES[@]}"; do
-        printf '  %-24s 发放于 %s\n' "${RELAY_NAMES[$i]}" "${RELAY_DATES[$i]}"
+    log "共 ${#USER_NAMES[@]} 个账号（名字 → 出口）"
+    for i in "${!USER_NAMES[@]}"; do
+        printf '  %-20s → %-14s %s（创建于 %s）\n' "${USER_NAMES[$i]}" "${USER_EXITS[$i]}" \
+            "$(exit_desc "${USER_EXITS[$i]}")" "${USER_DATES[$i]}"
     done
-    echo "  显示链接：edge relay show <名字>    吊销：edge relay remove <名字>"
+    echo "  显示链接：edge user show <名字>    改出口：edge user set-exit <名字> <出口>"
+    echo "  测试：    edge user test <名字>    删除：  edge user remove <名字>"
 }
 
-relay_remove() {
-    local name="${1:-}" n i tmp
-    relays_load
+user_set_exit() {  # user_set_exit <名字> <出口>
+    local name="${1:-}" out="${2:-}" i cur
+    users_load
+    exits_load
     if [ -z "$name" ]; then
-        [ -t 0 ] || die "用法：edge relay remove <名字>"
-        [ ${#RELAY_NAMES[@]} -gt 0 ] || { log "还没有发过通行证"; return 0; }
-        for i in "${!RELAY_NAMES[@]}"; do printf '  %d) %s\n' $((i + 1)) "${RELAY_NAMES[$i]}"; done
-        read -rp "吊销哪张（序号）: " n
-        [[ "$n" =~ ^[0-9]+$ ]] && [ "$n" -ge 1 ] && [ "$n" -le ${#RELAY_NAMES[@]} ] || die "序号不对"
-        name="${RELAY_NAMES[$((n - 1))]}"
-        confirm "确认吊销 $name？用它的入口机会立刻连不上" || { log "已取消"; return 0; }
+        [ -t 0 ] || die "用法：edge user set-exit <名字> <出口>"
+        pick_user name "修改哪个账号"
     fi
-    relay_index "$name" >/dev/null || die "没有叫 $name 的通行证（edge relay list 查看）"
-    relays_backup
-    tmp="$(mktemp)"
-    awk -v n="$name" '$1 != n' "$RELAYS_FILE" >"$tmp"
-    cat "$tmp" >"$RELAYS_FILE"
-    rm -f "$tmp"
-    if ! apply_quiet; then
-        relays_restore
-        die "吊销失败，已恢复（原因见上）"
+    i="$(user_index "$name")" || die "没有叫 $name 的账号（edge user list 查看）"
+    cur="${USER_EXITS[$i]}"
+    if [ -z "$out" ]; then
+        [ -t 0 ] || die "用法：edge user set-exit <名字> <出口>"
+        echo
+        echo "  $name 现在走：$cur（$(exit_desc "$cur")）"
+        pick_out out "改成哪个出口" "$cur"
     fi
-    rm -f "$RELAYS_BAK"
-    log "已吊销 $name：用它的入口机现在连不上本机了，其他客户端不受影响"
+    exit_known "$out" || die "没有叫 $out 的出口（edge exit list 查看；本机直接出网填 direct）"
+    if [ "$out" = "$cur" ]; then log "$name 已经走 $out，不用改"; return 0; fi
+    if [ "$out" = direct ] && [ -t 0 ]; then
+        confirm "改成 direct 后，$name 的流量从本机直接出网，确定？" || { log "已取消"; return 0; }
+    fi
+    chain_backup
+    USER_EXITS[$i]="$out"
+    users_save
+    chain_apply "修改失败"
+    log "账号 $name 的出口：$cur → $out（$(exit_desc "$out")）"
+    echo "  链接不变，客户端不用重新导入；验证：edge user test $name"
 }
 
-cmd_relay() {
+user_test() {  # user_test <名字>：模拟客户端用这个账号连本机，看流量是不是从该走的出口出去
+    local name="${1:-}" i out link
+    users_load
+    exits_load
+    load_keys
+    if [ -z "$name" ]; then
+        [ -t 0 ] || die "用法：edge user test <名字>"
+        pick_user name "测试哪个账号"
+    fi
+    i="$(user_index "$name")" || die "没有叫 $name 的账号（edge user list 查看）"
+    out="${USER_EXITS[$i]}"
+    if [ "$EDGE_ROLE" = edge ]; then
+        link="$(vless_link "${USER_UUIDS[$i]}" test)"
+    elif [ "$name" != default ] && [ -n "$EXIT_LISTEN" ] && exit_listen_check "$EXIT_LISTEN"; then
+        link="$(ss_link "${USER_SSKEYS[$i]}" test)"
+    else
+        die "$name 没有可以测试的入口"
+    fi
+    log "测试账号 $name：临时起一个客户端用它的链接连本机，看流量从哪出去（应该走 $out：$(exit_desc "$out")）"
+    if [ "$out" = direct ]; then upstream_probe "$link" local; else upstream_probe "$link"; fi \
+        || die "账号 $name 测试没通过（原因见上）"
+    log "账号 $name 测试通过"
+}
+
+user_remove() {  # user_remove <名字>
+    local name="${1:-}" i
+    users_load
+    if [ -z "$name" ]; then
+        [ -t 0 ] || die "用法：edge user remove <名字>"
+        [ ${#USER_NAMES[@]} -gt 0 ] || { log "还没有账号"; return 0; }
+        pick_user name "删除哪个账号"
+        confirm "确认删除 $name？用它的设备、入口机会立刻连不上" || { log "已取消"; return 0; }
+    fi
+    i="$(user_index "$name")" || die "没有叫 $name 的账号（edge user list 查看）"
+    if [ "$name" = default ] && [ "$EDGE_ROLE" = edge ]; then
+        die "default 是本机自带的账号（edge client 显示的就是它），不能删除；想让旧链接失效用 edge rotate-keys（所有账号的链接都会换）"
+    fi
+    chain_backup
+    unset "USER_NAMES[$i]" "USER_UUIDS[$i]" "USER_SSKEYS[$i]" "USER_DATES[$i]" "USER_EXITS[$i]"
+    users_save
+    chain_apply "删除失败"
+    log "已删除账号 $name：用它的设备 / 入口机现在连不上本机了，其他账号不受影响"
+}
+
+cmd_user() {
+    load_env
+    need_installed
+    local sub="${1:-list}" name
+    [ $# -gt 0 ] && shift
+    case "$sub" in
+        add)       user_add "$@" ;;
+        list|ls)   user_list ;;
+        show)      name="${1:-}"
+                   if [ -z "$name" ]; then
+                       [ -t 0 ] || die "用法：edge user show <名字>"
+                       users_load
+                       pick_user name "显示哪个账号的链接"
+                   fi
+                   user_print "$name" ;;
+        set-exit)  user_set_exit "$@" ;;
+        test)      user_test "$@" ;;
+        remove|rm) user_remove "$@" ;;
+        *)         die "用法：edge user add|list|show|set-exit|test|remove [名字]" ;;
+    esac
+}
+
+# ---------------------------------------------------------------- 出口
+# exit_check <名字> <链接> <force 0|1>：添加 / 更换出口前检查链接，并实际测试一次
+exit_check() {
+    local name="$1" link="$2" force="$3"
+    [[ "$name" =~ $NAME_RE ]] || die "出口名只能用字母、数字、- 和 _，最长 32 个字符：$name"
+    case "$name" in direct|block) die "$name 是保留名字，换一个" ;; esac
+    upstream_parse "$link" || die "这个链接用不了（原因见上）"
+    if [ "$EDGE_ROLE" = edge ] && [ "$UP_HOST" = "$REALITY_SNI" ]; then
+        die "这是本机自己的链接：出口必须是另一台机器"
+    fi
+    if [ -n "$EXIT_LISTEN" ] && exit_listen_check "$EXIT_LISTEN" 2>/dev/null && [ "$UP_HOST" = "$EXIT_IP" ]; then
+        die "这是本机内网入口的链接：出口必须是另一台机器"
+    fi
+    log "出口 $name：$UP_DESC"
+    [ -z "$UP_WARN" ] || warn "$UP_WARN"
+    log "先测试一下（临时启动一个测试用的 Xray，不影响正在运行的服务）"
+    if ! upstream_probe "$link"; then
+        if [ "$force" = 1 ]; then
+            warn "测试没通过，按 --force 仍然保存"
+        elif [ -t 0 ]; then
+            confirm "测试没通过，仍然保存吗？（走这个出口的账号在它恢复之前都上不了网）" \
+                || die "已取消，配置没有改动"
+        else
+            die "测试没通过，配置没有改动（确定要保存：加上 --force）"
+        fi
+    fi
+}
+
+# exit_args <参数...>：解析 "<名字> '<链接>' [--force]"，结果放在 EA_NAME / EA_LINK / EA_FORCE
+exit_args() {
+    local a
+    EA_NAME="" EA_LINK="" EA_FORCE=0
+    for a in "$@"; do
+        if [ "$a" = --force ]; then EA_FORCE=1
+        elif [ -z "$EA_NAME" ]; then EA_NAME="$a"
+        elif [ -z "$EA_LINK" ]; then EA_LINK="$a"
+        else die "参数太多：链接两边要加单引号"
+        fi
+    done
+}
+
+ask_link() {  # ask_link <变量名>
+    echo "支持 vless:// ss:// socks5:// http:// https:// 链接"
+    echo "另一台机器也是本项目搭的：在那台机器上运行 edge user add <名字>，复制它打印的链接"
+    ask "$1" "粘贴链接"
+}
+
+exit_add() {  # exit_add <名字> '<链接>' [--force]
+    local name link
+    exit_args "$@"
+    name="$EA_NAME" link="$EA_LINK"
+    exits_load
+    if [ -z "$name" ] || [ -z "$link" ]; then
+        [ -t 0 ] || die "用法：edge exit add <名字> '<链接>' [--force]"
+        [ -n "$name" ] || ask name "出口名字（字母、数字、- _，比如 us-b、jp-c）"
+        [ -n "$link" ] || ask_link link
+    fi
+    if out_index "$name" >/dev/null; then die "已经有叫 $name 的出口了（换链接：edge exit update $name '<链接>'）"; fi
+    exit_check "$name" "$link" "$EA_FORCE"
+    # 还没有账号走它，Xray 配置不变，不用重启
+    OUT_NAMES+=("$name") OUT_LINKS+=("$link")
+    exits_save
+    log "已添加出口 $name：$UP_DESC"
+    echo "  让账号走它：edge user add <名字> --exit $name，或者 edge user set-exit <账号> $name"
+}
+
+exit_update() {  # exit_update <名字> '<链接>' [--force]：更换出口的链接，账号不用改
+    local name link i
+    exit_args "$@"
+    name="$EA_NAME" link="$EA_LINK"
+    exits_load
+    users_load
+    if [ -z "$name" ]; then
+        [ -t 0 ] || die "用法：edge exit update <名字> '<链接>' [--force]"
+        pick_exit_name name "更换哪个出口的链接"
+    fi
+    i="$(out_index "$name")" || die "没有叫 $name 的出口（edge exit list 查看）"
+    if [ -z "$link" ]; then
+        [ -t 0 ] || die "用法：edge exit update <名字> '<链接>' [--force]"
+        ask_link link
+    fi
+    exit_check "$name" "$link" "$EA_FORCE"
+    chain_backup
+    OUT_LINKS[$i]="$link"
+    exits_save
+    if [ -n "$(users_using "$name")" ]; then
+        chain_apply "更换失败"
+    else
+        rm -rf "$CHAIN_BAK"
+    fi
+    log "出口 $name 已更换为：$UP_DESC"
+    echo "  走它的账号：$(users_using "$name")"
+}
+
+exit_list() {
+    local i users
+    exits_load
+    users_load
+    users="$(users_using direct)"
+    log "出口"
+    echo "  direct：本机直接出网（内置）"
+    echo "      账号：${users:-（没有）}"
+    for i in "${!OUT_NAMES[@]}"; do
+        users="$(users_using "${OUT_NAMES[$i]}")"
+        echo "  ${OUT_NAMES[$i]}：$(exit_desc "${OUT_NAMES[$i]}")"
+        echo "      链接：$(upstream_mask "${OUT_LINKS[$i]}")"
+        echo "      账号：${users:-（没有账号在用，不会放进 Xray 配置）}"
+    done
+    if [ ${#OUT_NAMES[@]} -eq 0 ]; then
+        echo "  还没有别的出口：edge exit add <名字> '<链接>'"
+    else
+        echo "  测试：edge exit test <名字>    换链接：edge exit update <名字> '<链接>'    删除：edge exit remove <名字>"
+    fi
+}
+
+exit_test() {  # exit_test <名字>
+    local name="${1:-}" i
+    exits_load
+    if [ -z "$name" ]; then
+        [ -t 0 ] || die "用法：edge exit test <名字>"
+        pick_exit_name name "测试哪个出口"
+    fi
+    [ "$name" != direct ] || die "direct 就是本机直接出网；想测某个账号用 edge user test <名字>"
+    i="$(out_index "$name")" || die "没有叫 $name 的出口（edge exit list 查看）"
+    log "测试出口 $name（临时启动一个测试用的 Xray，不影响正在运行的服务）"
+    upstream_probe "${OUT_LINKS[$i]}" || die "出口 $name 测试没通过（原因见上）"
+    log "出口 $name 测试通过"
+}
+
+exit_remove() {  # exit_remove <名字>：还有账号在用时拒绝删除
+    local name="${1:-}" i users
+    exits_load
+    users_load
+    if [ -z "$name" ]; then
+        [ -t 0 ] || die "用法：edge exit remove <名字>"
+        [ ${#OUT_NAMES[@]} -gt 0 ] || { log "还没有出口"; return 0; }
+        pick_exit_name name "删除哪个出口"
+    fi
+    [ "$name" != direct ] || die "direct 是内置出口，不能删除"
+    i="$(out_index "$name")" || die "没有叫 $name 的出口（edge exit list 查看）"
+    users="$(users_using "$name")"
+    if [ -n "$users" ]; then
+        die "还有账号在用出口 $name：$users。先用 edge user set-exit 把它们改到别的出口，或者 edge user remove 删掉"
+    fi
+    if [ -t 0 ]; then confirm "确认删除出口 $name？" || { log "已取消"; return 0; }; fi
+    # 没有账号走它，它本来就不在 Xray 配置里，不用重启
+    unset "OUT_NAMES[$i]" "OUT_LINKS[$i]"
+    exits_save
+    log "已删除出口 $name"
+}
+
+cmd_exit() {
     load_env
     need_installed
     local sub="${1:-list}"
     [ $# -gt 0 ] && shift
     case "$sub" in
-        add)       relay_add "$@" ;;
-        list|ls)   relay_list ;;
-        show)      [ -n "${1:-}" ] || die "用法：edge relay show <名字>"; relay_print "$1" ;;
-        remove|rm) relay_remove "$@" ;;
-        *)         die "用法：edge relay add|list|show|remove [名字]" ;;
+        add)       exit_add "$@" ;;
+        update)    exit_update "$@" ;;
+        list|ls)   exit_list ;;
+        test)      exit_test "$@" ;;
+        remove|rm) exit_remove "$@" ;;
+        *)         die "用法：edge exit add|update|list|test|remove [名字] ['<链接>']" ;;
     esac
 }
+
+# ---------------------------------------------------------------- 旧命令：edge upstream / edge relay
+# edge upstream 保留旧版的意思："本机所有账号都走这个上游"。出口名固定叫 upstream
+cmd_upstream() {
+    load_env
+    need_installed
+    local a link="" force=0 i moved others=""
+    for a in "$@"; do
+        if [ "$a" = --force ]; then force=1; else link="$a"; fi
+    done
+    users_load
+    exits_load
+    case "$link" in
+        "")
+            if i="$(out_index upstream)"; then
+                log "出口 upstream：$(exit_desc upstream)"
+                echo "  链接：$(upstream_mask "${OUT_LINKS[$i]}")"
+                echo "  走它的账号：$(users_using upstream)"
+                echo "  测试：edge upstream test    取消：edge upstream off"
+            else
+                log "没有出口 upstream：edge upstream '<链接>' 设置后，所有账号都走它"
+            fi
+            echo "  每个账号单独指定出口：edge exit / edge user（或者 edge chain 打开菜单）" ;;
+        test)
+            out_index upstream >/dev/null || die "没有出口 upstream"
+            exit_test upstream ;;
+        off)
+            out_index upstream >/dev/null || { log "没有出口 upstream，不用取消"; return 0; }
+            moved="$(users_using upstream)"
+            if [ -n "$moved" ] && [ -t 0 ]; then
+                confirm "取消后这些账号改为本机直接出网：$moved，确定？" || { log "已取消"; return 0; }
+            fi
+            chain_backup
+            for i in "${!USER_NAMES[@]}"; do
+                if [ "${USER_EXITS[$i]}" = upstream ]; then USER_EXITS[$i]=direct; fi
+            done
+            i="$(out_index upstream)"
+            unset "OUT_NAMES[$i]" "OUT_LINKS[$i]"
+            users_save
+            exits_save
+            chain_apply "取消失败"
+            log "已删除出口 upstream${moved:+；这些账号改为本机直接出网：$moved}" ;;
+        *)
+            for i in "${!USER_NAMES[@]}"; do
+                case "${USER_EXITS[$i]}" in
+                    direct|upstream) ;;
+                    *) others+="${others:+ }${USER_NAMES[$i]}→${USER_EXITS[$i]}" ;;
+                esac
+            done
+            if [ -n "$others" ]; then
+                [ -t 0 ] || die "有账号走别的出口（$others）：edge upstream 会把所有账号都改走 upstream。只改某个账号请用 edge user set-exit"
+                confirm "所有账号都会改走 upstream，包括走别的出口的：$others，确定？" || die "已取消，配置没有改动"
+            fi
+            exit_check upstream "$link" "$force"
+            chain_backup
+            if i="$(out_index upstream)"; then OUT_LINKS[$i]="$link"; else OUT_NAMES+=(upstream) OUT_LINKS+=("$link"); fi
+            for i in "${!USER_NAMES[@]}"; do USER_EXITS[$i]=upstream; done
+            exits_save
+            users_save
+            chain_apply "启用失败"
+            if [ ${#USER_NAMES[@]} -gt 0 ]; then
+                log "已启用上游：所有账号（${USER_NAMES[*]}）都经 $UP_ADDR 出去，本机不再直连任何网站"
+            else
+                log "已保存出口 upstream（$UP_ADDR）：还没有账号，创建时选它（edge user add <名字> --exit upstream）"
+            fi
+            echo "  客户端的配置不用改，照常连本机" ;;
+    esac
+}
+
+# edge relay：旧版的"通行证"，现在就是账号
+cmd_relay() { cmd_user "$@"; }
 
 # ---------------------------------------------------------------- 内网入口
 cmd_internal() {
     load_env
     need_installed
-    local v="${1:-}" old
+    local v="${1:-}" old n
     if [ "$v" = set ] || { [ -z "$v" ] && [ -t 0 ]; }; then
         if [ -z "$v" ]; then
             if [ -n "$EXIT_LISTEN" ]; then log "内网入口：$EXIT_LISTEN"; else log "内网入口：未开启"; fi
@@ -835,73 +1164,83 @@ cmd_internal() {
         die "设置失败，已恢复原来的设置（原因见上）"
     fi
     if [ "$v" = off ]; then
-        log "已关闭内网入口：通行证的内网链接失效，公网链接不受影响"
+        log "已关闭内网入口：账号的内网链接失效，公网链接不受影响"
         return 0
     fi
     log "内网入口：$v"
     warn "记得在云厂商的安全组 / 防火墙里放行 ${v##*:}/tcp 和 ${v##*:}/udp，来源只填入口机的内网 IP 或内网网段"
-    relays_load
-    if [ ${#RELAY_NAMES[@]} -eq 0 ]; then
-        log "下一步：给入口机发通行证 edge relay add <名字>"
+    users_load
+    n="$(internal_users)"
+    if [ "$n" -eq 0 ]; then
+        log "下一步：给入口机建一个账号 edge user add <名字>"
     else
-        log "已有的 ${#RELAY_NAMES[@]} 张通行证也能走内网了：edge relay show <名字> 显示内网链接"
+        log "已有的 $n 个账号也能走内网了：edge user show <名字> 显示内网链接（default 不进内网入口）"
     fi
 }
 
-# ---------------------------------------------------------------- 链式代理菜单
+# ---------------------------------------------------------------- 账号 / 出口菜单
 chain_header() {
-    local role up="本机直接出网" internal="未开启"
+    local role i
     load_env
-    relays_load
+    users_load
+    exits_load
     if [ "$EDGE_ROLE" = exit ]; then role="纯内网出口"; else role="完整节点"; fi
-    if [ -n "$UPSTREAM" ]; then
-        if upstream_parse "$UPSTREAM" 2>/dev/null; then up="经上游 $UP_DESC"; else up="UPSTREAM 链接有问题"; fi
-    fi
-    [ -z "$EXIT_LISTEN" ] || internal="$EXIT_LISTEN"
     cat <<EOF
 
-================ 链式代理 ================
+================ 账号 / 出口 ================
   本机角色 : $role
-  出口     : $up
-  内网入口 : $internal
-  通行证   : ${#RELAY_NAMES[@]} 张
+  内网入口 : ${EXIT_LISTEN:-未开启}
+  出口     : direct（本机直接出网）${OUT_NAMES[*]:+ ${OUT_NAMES[*]}}
 EOF
+    if [ ${#USER_NAMES[@]} -eq 0 ]; then
+        echo "  账号     : 还没有"
+    else
+        echo "  账号     : ${#USER_NAMES[@]} 个（名字 → 出口）"
+        for i in "${!USER_NAMES[@]}"; do
+            printf '    %-20s → %s\n' "${USER_NAMES[$i]}" "${USER_EXITS[$i]}"
+        done
+    fi
 }
 
 menu_chain() {
-    local c link name
+    local c name
     while :; do
         (chain_header) || true
         cat <<'EOF'
-  ---- 本机当入口：把流量转给另一台机器出去 ----
-  1) 设置上游（粘贴链接，先测试再启用）
-  2) 测试上游
-  3) 取消上游，恢复直接出网
-  ---- 本机当出口：让别的机器把流量转过来 ----
-  4) 发通行证（给入口机用）
-  5) 查看通行证 / 再次显示链接
-  6) 吊销通行证
-  7) 开启 / 修改内网入口（同一内网的入口机用）
-  8) 关闭内网入口
+  ---- 出口：账号的流量从哪出去（另一台机器、第三方代理）----
+  1) 添加出口（粘贴链接，先测试再保存）
+  2) 查看 / 测试出口
+  3) 更换出口的链接
+  4) 删除出口
+  ---- 账号：每个账号一条链接，各走各的出口 ----
+  5) 添加账号（选出口）
+  6) 查看账号 / 显示链接
+  7) 修改账号的出口
+  8) 测试账号（流量是不是从该走的出口出去）
+  9) 删除账号
+  ---- 内网入口：给同一内网里的入口机用 ----
+ 10) 开启 / 修改内网入口
+ 11) 关闭内网入口
   0) 返回
 EOF
         read -rp "请选择: " c || return 0
         echo
         case "$c" in
-            1) echo "支持 vless:// ss:// socks5:// http:// https:// 链接"
-               echo "上游也是本项目搭的：在那台机器上运行 edge relay add <名字>，复制它打印的链接"
-               read -rp "粘贴上游链接: " link
-               [ -n "$link" ] && bash "$SELF" upstream "$link" ;;
-            2) bash "$SELF" upstream test ;;
-            3) confirm "取消后代理流量直接从本机出网，确定？" && bash "$SELF" upstream off ;;
-            4) read -rp "通行证名字（字母、数字、- _，比如入口机的名字 A01）: " name
-               [ -n "$name" ] && bash "$SELF" relay add "$name" ;;
-            5) bash "$SELF" relay list
-               read -rp "显示哪张的链接（输入名字，留空跳过）: " name
-               [ -n "$name" ] && bash "$SELF" relay show "$name" ;;
-            6) bash "$SELF" relay remove ;;
-            7) bash "$SELF" internal set ;;
-            8) confirm "关闭后入口机就不能走内网连本机了，确定？" && bash "$SELF" internal off ;;
+            1) bash "$SELF" exit add ;;
+            2) bash "$SELF" exit list
+               read -rp "测试哪个出口（输入名字，留空跳过）: " name
+               [ -z "$name" ] || bash "$SELF" exit test "$name" ;;
+            3) bash "$SELF" exit update ;;
+            4) bash "$SELF" exit remove ;;
+            5) bash "$SELF" user add ;;
+            6) bash "$SELF" user list
+               read -rp "显示哪个账号的链接（输入名字，留空跳过）: " name
+               [ -z "$name" ] || bash "$SELF" user show "$name" ;;
+            7) bash "$SELF" user set-exit ;;
+            8) bash "$SELF" user test ;;
+            9) bash "$SELF" user remove ;;
+            10) bash "$SELF" internal set ;;
+            11) confirm "关闭后入口机就不能走内网连本机了，确定？" && bash "$SELF" internal off ;;
             0|q|"") return 0 ;;
             *) warn "没有这个选项" ;;
         esac || true
@@ -927,7 +1266,7 @@ menu_edge() {
  10) 重新安装 / 修复
  11) 轮换 Xray 密钥
  12) 查看 Xray 配置
- 13) 链式代理（上游 / 通行证 / 内网入口）
+ 13) 账号 / 出口 / 内网入口（多账号、链式代理）
   0) 退出
 EOF
         read -rp "请选择: " c || exit 0
@@ -962,13 +1301,13 @@ menu_exit() {
 
 ================ vps-edge（内网出口）================
   1) 健康检查
-  2) 链式代理（通行证 / 内网入口 / 上游）
-  3) 发通行证（给入口机用）
-  4) 查看通行证 / 再次显示链接
+  2) 账号 / 出口 / 内网入口
+  3) 添加账号（给入口机用）
+  4) 查看账号 / 显示链接
   5) 改了 .env 后重新生成配置
   6) 更新 Xray 镜像
   7) 重新安装 / 修复
-  8) 轮换密钥（所有通行证链接都会失效）
+  8) 轮换密钥（所有账号的链接都会失效）
   9) 查看 Xray 配置
  10) 查看 Xray 日志
   0) 退出
@@ -978,11 +1317,10 @@ EOF
         case "$c" in
             1) bash "$SELF" check ;;
             2) menu_chain ;;
-            3) read -rp "通行证名字（字母、数字、- _，比如入口机的名字 A01）: " name
-               [ -n "$name" ] && bash "$SELF" relay add "$name" ;;
-            4) bash "$SELF" relay list
-               read -rp "显示哪张的链接（输入名字，留空跳过）: " name
-               [ -n "$name" ] && bash "$SELF" relay show "$name" ;;
+            3) bash "$SELF" user add ;;
+            4) bash "$SELF" user list
+               read -rp "显示哪个账号的链接（输入名字，留空跳过）: " name
+               [ -z "$name" ] || bash "$SELF" user show "$name" ;;
             5) bash "$SELF" apply ;;
             6) bash "$SELF" update ;;
             7) bash "$SELF" install ;;
@@ -1022,6 +1360,8 @@ case "$cmd" in
     logs)        cmd_logs "$@" ;;
     xray)        cmd_xray "$@" ;;
     chain)       menu_chain ;;
+    user)        cmd_user "$@" ;;
+    exit)        cmd_exit "$@" ;;
     upstream)    cmd_upstream "$@" ;;
     relay)       cmd_relay "$@" ;;
     internal)    cmd_internal "$@" ;;

@@ -30,14 +30,16 @@ if [ "$EDGE_ROLE" = edge ]; then
     grep -qE '[:.]80$'         <<<"$LISTEN" && bad "检测到有进程监听 80 端口：$(grep -E '[:.]80$' <<<"$LISTEN" | tr '\n' ' ')" || ok "80 端口未监听"
     grep -qE '^(0\.0\.0\.0|\*|\[::\]):(8443|10443)$' <<<"$LISTEN" && bad "8443/10443 暴露在公网地址上"
 fi
+users_load
+exits_load
 if [ -n "$EXIT_LISTEN" ]; then
-    relays_load
+    NINTERNAL="$(internal_users)"
     if [ -z "$EXIT_ADDR" ]; then
         bad "EXIT_LISTEN=$EXIT_LISTEN 不对（edge internal 重新设置）"
-    elif [ "${#RELAY_NAMES[@]}" -eq 0 ]; then
-        info "内网入口 $EXIT_ADDR 还没有发过通行证，暂不监听（edge relay add <名字>）"
+    elif [ "$NINTERNAL" -eq 0 ]; then
+        info "内网入口 $EXIT_ADDR 还没有可用的账号，暂不监听（edge user add <名字>）"
     elif grep -qx "$EXIT_ADDR" <<<"$LISTEN"; then
-        ok "$EXIT_ADDR (内网入口，${#RELAY_NAMES[@]} 张通行证)"
+        ok "$EXIT_ADDR (内网入口，$NINTERNAL 个账号)"
     else
         bad "内网入口 $EXIT_ADDR 未监听（docker logs xray）"
     fi
@@ -93,15 +95,31 @@ if [ "$EDGE_ROLE" = edge ]; then
     done
 fi
 
-if [ -n "$UPSTREAM" ]; then
-    echo "== 上游 =="
-    if upstream_parse "$UPSTREAM" 2>/dev/null; then
-        ok "上游：$UP_DESC"
-        [ -z "$UP_WARN" ] || info "$UP_WARN"
-        if upstream_probe "$UPSTREAM"; then ok "经上游出网正常"; else bad "经上游出网失败（原因见上；edge upstream test 可以单独重试）"; fi
-    else
-        bad "UPSTREAM 链接看不懂（edge upstream '<链接>' 重新设置，或 edge upstream off 取消）"
-    fi
+if [ ${#OUT_NAMES[@]} -gt 0 ] || [ ${#USER_NAMES[@]} -gt 1 ]; then
+    echo "== 账号 / 出口 =="
+    for i in "${!USER_NAMES[@]}"; do
+        if exit_known "${USER_EXITS[$i]}"; then
+            ok "账号 ${USER_NAMES[$i]} → ${USER_EXITS[$i]}"
+        else
+            bad "账号 ${USER_NAMES[$i]} 的出口 ${USER_EXITS[$i]} 不存在（edge user set-exit ${USER_NAMES[$i]} <出口>）"
+        fi
+    done
+    # 只测有账号在用的出口：没人用的出口不在 Xray 配置里
+    for i in "${!OUT_NAMES[@]}"; do
+        users="$(users_of "${OUT_NAMES[$i]}")"
+        if [ -z "$users" ]; then
+            info "出口 ${OUT_NAMES[$i]} 没有账号在用（不在 Xray 配置里，不测试）"
+        elif upstream_parse "${OUT_LINKS[$i]}" 2>/dev/null; then
+            [ -z "$UP_WARN" ] || info "出口 ${OUT_NAMES[$i]}：$UP_WARN"
+            if upstream_probe "${OUT_LINKS[$i]}"; then
+                ok "出口 ${OUT_NAMES[$i]}（$UP_DESC）出网正常"
+            else
+                bad "出口 ${OUT_NAMES[$i]} 出网失败，走它的账号现在上不了网（原因见上；edge exit test ${OUT_NAMES[$i]} 单独重试）"
+            fi
+        else
+            bad "出口 ${OUT_NAMES[$i]} 的链接看不懂（edge exit update ${OUT_NAMES[$i]} '<链接>' 重新设置）"
+        fi
+    done
 fi
 
 if [ "$EDGE_ROLE" = edge ]; then

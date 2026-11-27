@@ -1,20 +1,24 @@
 #!/usr/bin/env bash
-# 输出客户端配置：VLESS 分享链接 + mihomo (Clash Meta) 配置片段；以及链式代理的状态
+# 输出客户端配置：default 账号的 VLESS 分享链接 + mihomo (Clash Meta) 配置片段；以及账号 / 出口的情况
 . "$(cd "$(dirname "$0")" && pwd)/lib.sh"
 load_env
 load_keys
+users_load
+exits_load
 
 if [ "$EDGE_ROLE" = edge ]; then
+    i="$(user_index default)" || die "没有账号 default（手机用的那条链接）：运行 edge user add default 重新创建"
+    DEFAULT_UUID="${USER_UUIDS[$i]}"
     # YAML 双引号字符串：转义 \ 和 "
-    NODE_NAME_YAML="${NODE_NAME//\\/\\\\}"
+    NODE_NAME_YAML="${NODE_NAME//\/\\}"
     NODE_NAME_YAML="${NODE_NAME_YAML//\"/\\\"}"
-    LINK="$(vless_link "$XRAY_UUID" "$NODE_NAME")"
+    LINK="$(vless_link "$DEFAULT_UUID" "$NODE_NAME")"
 
-    cat <<EOF
-================ 客户端配置 ================
+    cat <<EOT
+================ 客户端配置（账号 default）================
 地址 (address)     : ${REALITY_SNI}
 端口 (port)        : 443
-UUID (id)          : ${XRAY_UUID}
+UUID (id)          : ${DEFAULT_UUID}
 流控 (flow)        : xtls-rprx-vision
 传输 (network)     : tcp
 安全 (security)    : reality
@@ -22,6 +26,7 @@ SNI (serverName)   : ${REALITY_SNI}
 指纹 (fingerprint) : chrome
 公钥 (publicKey)   : ${XRAY_PUBLIC_KEY}
 shortId            : ${XRAY_SHORT_ID}
+出口               : ${USER_EXITS[$i]}（$(exit_desc "${USER_EXITS[$i]}")）
 
 ---- 分享链接 ----
 ${LINK}
@@ -32,7 +37,7 @@ proxies:
     type: vless
     server: ${REALITY_SNI}
     port: 443
-    uuid: ${XRAY_UUID}
+    uuid: ${DEFAULT_UUID}
     network: tcp
     udp: true
     tls: true
@@ -44,32 +49,26 @@ proxies:
       short-id: ${XRAY_SHORT_ID}
       support-x25519mlkem768: true
 ============================================
-EOF
+EOT
 else
-    cat <<'EOF'
+    cat <<'EOT'
 ================ 内网出口模式 ================
 这台机器只给同一内网里的入口机当出口（EDGE_ROLE=exit），没有给手机直接用的链接。
-入口机要用的链接通过"通行证"发放：
-  edge relay add <名字>     发一张通行证，打印链接
-  edge relay list           查看已发的通行证
+入口机用的链接，给每台入口机建一个账号：
+  edge user add <名字>      新建账号，打印内网链接
+  edge user list            查看账号
 ==============================================
-EOF
+EOT
 fi
 
-# ---------- 链式代理状态（只在用到时显示）----------
-relays_load
-if [ -n "$UPSTREAM" ] || [ "${#RELAY_NAMES[@]}" -gt 0 ] || [ -n "$EXIT_LISTEN" ]; then
+# ---------- 账号 / 出口（只有一个 default 账号、没有出口和内网入口时不显示）----------
+if [ ${#OUT_NAMES[@]} -gt 0 ] || [ ${#USER_NAMES[@]} -gt 1 ] || [ -n "$EXIT_LISTEN" ] \
+   || { [ "$EDGE_ROLE" = exit ] && [ ${#USER_NAMES[@]} -gt 0 ]; }; then
     echo
-    echo "---- 链式代理 ----"
-    if [ -n "$UPSTREAM" ]; then
-        if upstream_parse "$UPSTREAM" 2>/dev/null; then
-            echo "出口      : 经上游 $UP_DESC（本机不直连任何网站）"
-        else
-            echo "出口      : UPSTREAM 链接有问题，运行 edge upstream 查看"
-        fi
-    else
-        echo "出口      : 本机直接出网"
-    fi
-    if [ -n "$EXIT_LISTEN" ]; then echo "内网入口  : $EXIT_LISTEN"; fi
-    echo "通行证    : ${#RELAY_NAMES[@]} 张（edge relay list 查看，edge relay show <名字> 显示链接）"
+    echo "---- 账号 / 出口 ----"
+    for i in "${!USER_NAMES[@]}"; do
+        printf '  %-20s → %s（%s）\n' "${USER_NAMES[$i]}" "${USER_EXITS[$i]}" "$(exit_desc "${USER_EXITS[$i]}")"
+    done
+    if [ -n "$EXIT_LISTEN" ]; then echo "  内网入口：$EXIT_LISTEN"; fi
+    echo "  其他账号的链接：edge user show <名字>    管理账号和出口：edge chain"
 fi

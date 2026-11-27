@@ -1,15 +1,14 @@
 #!/usr/bin/env bash
 # 生成 Xray 密钥（只在第一次生成，之后复用）并渲染 nginx / xray 配置
 # 用法：
-#   bash scripts/02-init.sh                 # 首次初始化，或修改 .env / 模板 / 通行证后重新渲染
-#   bash scripts/02-init.sh --rotate-keys   # 重新生成 UUID、密钥、shortId（旧客户端会失效）
+#   bash scripts/02-init.sh                 # 首次初始化，或修改 .env / 模板 / 账号 / 出口后重新渲染
+#   bash scripts/02-init.sh --rotate-keys   # 重新生成密钥、shortId 和所有账号的 UUID（旧客户端会失效）
 #
 # Xray 配置由几块拼成（都在 templates/ 下）：
 #   xray-config.json.tpl            外框
-#   xray/inbound-reality.json.tpl   公网入口（完整节点才有）
-#   xray/inbound-internal.json.tpl  内网入口（.env 填了 EXIT_LISTEN 且发过通行证才有）
-#   xray/egress-direct.json.tpl     直接出网 + 拦截规则（没填 UPSTREAM 时）
-#   xray/egress-upstream.json.tpl   全部转给上游（填了 UPSTREAM 时）
+#   xray/inbound-reality.json.tpl   公网入口（完整节点才有）：所有账号
+#   xray/inbound-internal.json.tpl  内网入口（.env 填了 EXIT_LISTEN 且有 default 以外的账号才有）
+#   xray/egress.json.tpl            出口和路由：每个账号走自己的出口（由 lib.sh 的 xray_egress 生成）
 . "$(cd "$(dirname "$0")" && pwd)/lib.sh"
 load_env
 
@@ -39,13 +38,14 @@ fi
 if [ -n "$EXIT_LISTEN" ]; then
     exit_listen_check "$EXIT_LISTEN" || die ".env 里 EXIT_LISTEN 不对（原因见上）：运行 edge internal 重新设置"
 fi
-if [ -n "$UPSTREAM" ]; then
-    upstream_parse "$UPSTREAM" || die ".env 里 UPSTREAM 的链接不对（原因见上）：运行 edge upstream '<链接>' 重新设置，或 edge upstream off 取消"
-    if [ "$UP_HOST" = "$REALITY_SNI" ] || [ "$UP_HOST" = "${EXIT_IP:-}" ]; then
-        die "UPSTREAM 指向的是本机（$UP_HOST）：上游必须是另一台机器"
-    fi
-    # edge upstream 设置时已经提醒过一次，这里不再重复
-    [ -z "$UP_WARN" ] || [ "${EDGE_UPSTREAM_WARNED:-0}" = 1 ] || warn "$UP_WARN"
+# .env 的 UPSTREAM 是旧版的写法：现在出口由 edge exit 管理（xray/exits.env）
+# 只有"刚从旧版迁移过来、还没清理"时允许它有值（迁移时会留下 xray/upstream.migrated）；
+# 否则说明是照着旧文档手动填的，直接报错：悄悄忽略的话，流量会和你以为的走法不一样
+UPSTREAM_CLEANUP=0
+if [ -n "$UPSTREAM" ] && [ -f "$USERS_FILE" ] && [ ! -f "$UPSTREAM_MIGRATED" ]; then
+    die ".env 里的 UPSTREAM 已经不再使用，出口改由 edge exit 管理。请先清空 .env 里 UPSTREAM 的值，然后：
+    所有账号都走这个上游：edge upstream '<链接>'
+    只让某个账号走它：    edge exit add <出口名> '<链接>'，再 edge user set-exit <账号> <出口名>"
 fi
 
 # 旧版本用的是 teddysun/xray：它的启动方式和官方镜像不同，跟现在的 docker-compose.yml 不兼容，自动切换
@@ -100,7 +100,8 @@ gen_x25519() {
 # 否则坏配置会留在磁盘上：nginx 暂时还用着内存里的旧配置，
 # 但下次容器重启（VPS 重启、edge update）就起不来，网站和代理一起中断
 GENERATED=("$EDGE_DIR/nginx/nginx.conf" "$EDGE_DIR/nginx/conf.d/00-decoy.conf"
-           "$EDGE_DIR/xray/config.json" "$KEYS_FILE")
+           "$EDGE_DIR/xray/config.json" "$KEYS_FILE"
+           "$USERS_FILE" "$EXITS_FILE" "$UPSTREAM_MIGRATED")
 BACKUP_DIR="$(mktemp -d)"
 COMMITTED=0
 for f in "${GENERATED[@]}"; do
@@ -127,7 +128,9 @@ on_exit() {
 trap on_exit EXIT
 
 if [ "$ROTATE" -eq 1 ] && [ -f "$KEYS_FILE" ]; then
-    cp "$KEYS_FILE" "$KEYS_FILE.bak.$(date +%Y%m%d%H%M%S)"
+    stamp="$(date +%Y%m%d%H%M%S)"
+    cp -p "$KEYS_FILE" "$KEYS_FILE.bak.$stamp"
+    if [ -f "$USERS_FILE" ]; then cp -p "$USERS_FILE" "$USERS_FILE.bak.$stamp"; fi
     rm -f "$KEYS_FILE"
     warn "已备份并删除旧密钥，将重新生成"
 fi
@@ -142,15 +145,14 @@ if [ -f "$KEYS_FILE" ]; then
         log "已补充内网入口用的服务端密钥（SS_SERVER_KEY）"
     fi
 else
-    log "生成 Xray UUID / X25519 密钥 / shortId"
-    XRAY_UUID="$(gen_uuid)"
+    log "生成 Xray X25519 密钥 / shortId"
     gen_x25519
     XRAY_SHORT_ID="$(openssl rand -hex 8)"
     SS_SERVER_KEY="$(gen_ss_key)"
     umask 077
+    # 账号的 UUID 不在这里：每个账号一个，记在 xray/users.env（旧版这里的 XRAY_UUID 会迁移成账号 default）
     cat >"$KEYS_FILE" <<EOF
 # 由 02-init.sh 生成，请妥善备份；泄露后用 --rotate-keys 轮换
-XRAY_UUID=$XRAY_UUID
 XRAY_PRIVATE_KEY=$XRAY_PRIVATE_KEY
 XRAY_PUBLIC_KEY=$XRAY_PUBLIC_KEY
 XRAY_SHORT_ID=$XRAY_SHORT_ID
@@ -187,10 +189,24 @@ if [ "$EDGE_ROLE" = edge ]; then
     log "伪装站：反向代理到 $UPSTREAM_ADDR"
 fi
 
-# ---------- Xray ----------
+# ---------- 账号和出口 ----------
 T="$EDGE_DIR/templates/xray"
-relays_load
-NRELAY=${#RELAY_NAMES[@]}
+users_load      # 第一次运行新版时，会把旧版的主 UUID、通行证、UPSTREAM 迁移过来（lib.sh 的 chain_migrate）
+exits_load
+if [ -n "$UPSTREAM" ]; then UPSTREAM_CLEANUP=1; fi   # 走到这里说明刚迁移过：配置生效后清空 .env 的 UPSTREAM
+
+if [ "$EDGE_ROLE" = edge ] && ! user_index default >/dev/null; then
+    die "$USERS_FILE 里没有账号 default（手机用的那条链接）：运行 edge user add default 重新创建"
+fi
+if [ "$ROTATE" -eq 1 ]; then
+    # REALITY 公钥和内网入口的服务端密钥都换了，所有链接本来就要重新导入，账号凭据一起换掉
+    for i in "${!USER_NAMES[@]}"; do
+        USER_UUIDS[$i]="$(gen_uuid)"
+        USER_SSKEYS[$i]="$(gen_ss_key)"
+    done
+    users_save
+    log "已重新生成 ${#USER_NAMES[@]} 个账号的 UUID 和密钥"
+fi
 
 # ---------- DNS 自动记录 ----------
 if [ "$EDGE_ROLE" = edge ]; then
@@ -198,13 +214,17 @@ if [ "$EDGE_ROLE" = edge ]; then
     ensure_all_sites_dns
 fi
 
-# 公网入口的用户：主 UUID（给手机等客户端）+ 每张通行证一个 UUID
-REALITY_CLIENTS="          { \"id\": \"$XRAY_UUID\", \"flow\": \"xtls-rprx-vision\", \"email\": \"default@edge\" }"
-SS_CLIENTS=""
-for i in "${!RELAY_NAMES[@]}"; do
-    REALITY_CLIENTS+=$',\n'"          { \"id\": \"${RELAY_UUIDS[$i]}\", \"flow\": \"xtls-rprx-vision\", \"email\": \"relay-${RELAY_NAMES[$i]}@edge\" }"
-    SS_CLIENTS+="${SS_CLIENTS:+$',\n'}          { \"password\": \"${RELAY_SSKEYS[$i]}\", \"email\": \"relay-${RELAY_NAMES[$i]}@edge\" }"
+# ---------- Xray ----------
+# 公网入口：所有账号；内网入口：default 以外的账号（default 是手机用的，和以前一样不进内网入口）
+REALITY_CLIENTS="" SS_CLIENTS=""
+for i in "${!USER_NAMES[@]}"; do
+    email="$(user_email "${USER_NAMES[$i]}")"
+    REALITY_CLIENTS+="${REALITY_CLIENTS:+$',\n'}          { \"id\": \"${USER_UUIDS[$i]}\", \"flow\": \"xtls-rprx-vision\", \"email\": \"$email\" }"
+    if [ "${USER_NAMES[$i]}" != default ]; then
+        SS_CLIENTS+="${SS_CLIENTS:+$',\n'}          { \"password\": \"${USER_SSKEYS[$i]}\", \"email\": \"$email\" }"
+    fi
 done
+NINTERNAL="$(internal_users)"
 
 XRAY_INBOUNDS=""
 if [ "$EDGE_ROLE" = edge ]; then
@@ -212,24 +232,26 @@ if [ "$EDGE_ROLE" = edge ]; then
         REALITY_CLIENTS REALITY_SNI XRAY_PRIVATE_KEY XRAY_SHORT_ID)"
 fi
 if [ -n "$EXIT_LISTEN" ]; then
-    # 一张通行证都没有时不开内网入口：Shadowsocks 2022 没有用户时会退化成单用户模式，
-    # 只凭服务端密钥就能连，已吊销的入口机手里正好有这个密钥
-    if [ "$NRELAY" -gt 0 ]; then
+    # 没有可用的账号时不开内网入口：Shadowsocks 2022 没有用户时会退化成单用户模式，
+    # 只凭服务端密钥就能连，已删除账号的入口机手里正好有这个密钥
+    if [ "$NINTERNAL" -gt 0 ]; then
         frag="$(render_text "$T/inbound-internal.json.tpl" EXIT_IP EXIT_PORT SS_METHOD SS_SERVER_KEY SS_CLIENTS)"
         XRAY_INBOUNDS+="${XRAY_INBOUNDS:+$',\n'}$frag"
-        log "内网入口：$EXIT_IP:$EXIT_PORT（$NRELAY 张通行证）"
+        log "内网入口：$EXIT_IP:$EXIT_PORT（$NINTERNAL 个账号）"
     else
-        warn "内网入口 $EXIT_IP:$EXIT_PORT 还没有发过通行证，暂不监听：运行 edge relay add <名字>"
+        warn "内网入口 $EXIT_IP:$EXIT_PORT 还没有可用的账号，暂不监听：运行 edge user add <名字>"
     fi
 fi
 
-if [ -n "$UPSTREAM" ]; then
-    UPSTREAM_OUTBOUND="$UP_OUTBOUND"
-    XRAY_EGRESS="$(render_text "$T/egress-upstream.json.tpl" UPSTREAM_OUTBOUND)"
-    log "出口：全部经上游 $UP_DESC（本机不直连）"
-else
-    XRAY_EGRESS="$(render_text "$T/egress-direct.json.tpl")"
-fi
+# 出口和路由：每个账号严格走自己的出口，没有任何回落（规则见 lib.sh 的 xray_egress）
+xray_egress
+XRAY_OUTBOUNDS="$EGRESS_OUTBOUNDS"
+XRAY_RULES="$EGRESS_RULES"
+XRAY_DOMAIN_STRATEGY="$EGRESS_DOMAIN_STRATEGY"
+XRAY_EGRESS="$(render_text "$T/egress.json.tpl" XRAY_OUTBOUNDS XRAY_DOMAIN_STRATEGY XRAY_RULES)"
+for i in "${!USER_NAMES[@]}"; do
+    log "账号 ${USER_NAMES[$i]} → ${USER_EXITS[$i]}（$(exit_desc "${USER_EXITS[$i]}")）"
+done
 
 render "$EDGE_DIR/templates/xray-config.json.tpl" "$EDGE_DIR/xray/config.json" \
     XRAY_INBOUNDS XRAY_EGRESS
@@ -258,6 +280,17 @@ else
     warn "本机还没有 $XRAY_IMAGE 镜像，跳过 Xray 配置检查"
 fi
 COMMITTED=1
+
+# ---------- 清理旧版数据（新配置已经检查通过，数据都在 users.env / exits.env 里了）----------
+if [ "$UPSTREAM_CLEANUP" -eq 1 ]; then
+    sed -i -E 's#^UPSTREAM=.*#UPSTREAM=#' "$EDGE_DIR/.env"
+    log ".env 里的 UPSTREAM 已迁移为出口 upstream，原来的值已清空（以后用 edge exit 管理出口）"
+fi
+rm -f "$UPSTREAM_MIGRATED"
+if [ -f "$RELAYS_FILE" ]; then
+    mv -f "$RELAYS_FILE" "$RELAYS_FILE.migrated"
+    log "通行证已迁移为账号，旧文件改名为 xray/relays.env.migrated（确认没问题后可以删除）"
+fi
 
 # ---------- 生效 / 下一步 ----------
 if [ "$EDGE_ROLE" = edge ]; then
