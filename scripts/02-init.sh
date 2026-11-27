@@ -38,15 +38,6 @@ fi
 if [ -n "$EXIT_LISTEN" ]; then
     exit_listen_check "$EXIT_LISTEN" || die ".env 里 EXIT_LISTEN 不对（原因见上）：运行 edge internal 重新设置"
 fi
-# .env 的 UPSTREAM 是旧版的写法：现在出口由 edge exit 管理（xray/exits.env）
-# 只有"刚从旧版迁移过来、还没清理"时允许它有值（迁移时会留下 xray/upstream.migrated）；
-# 否则说明是照着旧文档手动填的，直接报错：悄悄忽略的话，流量会和你以为的走法不一样
-UPSTREAM_CLEANUP=0
-if [ -n "$UPSTREAM" ] && [ -f "$USERS_FILE" ] && [ ! -f "$UPSTREAM_MIGRATED" ]; then
-    die ".env 里的 UPSTREAM 已经不再使用，出口改由 edge exit 管理。请先清空 .env 里 UPSTREAM 的值，然后：
-    所有账号都走这个上游：edge upstream '<链接>'
-    只让某个账号走它：    edge exit add <出口名> '<链接>'，再 edge user set-exit <账号> <出口名>"
-fi
 
 # 旧版本用的是 teddysun/xray：它的启动方式和官方镜像不同，跟现在的 docker-compose.yml 不兼容，自动切换
 if [[ "$XRAY_IMAGE" == teddysun/* ]]; then
@@ -101,7 +92,7 @@ gen_x25519() {
 # 但下次容器重启（VPS 重启、edge update）就起不来，网站和代理一起中断
 GENERATED=("$EDGE_DIR/nginx/nginx.conf" "$EDGE_DIR/nginx/conf.d/00-decoy.conf"
            "$EDGE_DIR/xray/config.json" "$KEYS_FILE"
-           "$USERS_FILE" "$EXITS_FILE" "$UPSTREAM_MIGRATED")
+           "$USERS_FILE" "$EXITS_FILE")
 BACKUP_DIR="$(mktemp -d)"
 COMMITTED=0
 for f in "${GENERATED[@]}"; do
@@ -146,11 +137,12 @@ if [ -f "$KEYS_FILE" ]; then
     fi
 else
     log "生成 Xray X25519 密钥 / shortId"
+    KEYS_NEW=1
     gen_x25519
     XRAY_SHORT_ID="$(openssl rand -hex 8)"
     SS_SERVER_KEY="$(gen_ss_key)"
     umask 077
-    # 账号的 UUID 不在这里：每个账号一个，记在 xray/users.env（旧版这里的 XRAY_UUID 会迁移成账号 default）
+    # 账号的 UUID 不在这里：每个账号一个，记在 xray/users.env
     cat >"$KEYS_FILE" <<EOF
 # 由 02-init.sh 生成，请妥善备份；泄露后用 --rotate-keys 轮换
 XRAY_PRIVATE_KEY=$XRAY_PRIVATE_KEY
@@ -182,21 +174,26 @@ if [ "$EDGE_ROLE" = edge ]; then
     SITE_DOMAIN="$REALITY_SNI"
     UPSTREAM_ADDR="127.0.0.1:$DECOY_PORT"
     CERT_DOMAIN="$REALITY_CERT_DOMAIN"
-    UPSTREAM_SAVED="$UPSTREAM" UPSTREAM="$UPSTREAM_ADDR"    # site.conf.tpl 用的是 __UPSTREAM__（反代后端）
+    UPSTREAM="$UPSTREAM_ADDR"    # site.conf.tpl 用的是 __UPSTREAM__（反代后端）
     render "$EDGE_DIR/templates/site.conf.tpl" "$EDGE_DIR/nginx/conf.d/00-decoy.conf" \
         SITE_DOMAIN UPSTREAM CERT_DOMAIN
-    UPSTREAM="$UPSTREAM_SAVED"
     log "伪装站：反向代理到 $UPSTREAM_ADDR"
 fi
 
 # ---------- 账号和出口 ----------
 T="$EDGE_DIR/templates/xray"
-users_load      # 第一次运行新版时，会把旧版的主 UUID、通行证、UPSTREAM 迁移过来（lib.sh 的 chain_migrate）
+users_load
 exits_load
-if [ -n "$UPSTREAM" ]; then UPSTREAM_CLEANUP=1; fi   # 走到这里说明刚迁移过：配置生效后清空 .env 的 UPSTREAM
 
+# 完整节点自带账号 default（手机用的那条链接）：只在第一次生成密钥时自动创建
+# 已有密钥却没有 default，说明 users.env 丢了或被改过：报错，不悄悄换一个新 UUID（手机会连不上）
 if [ "$EDGE_ROLE" = edge ] && ! user_index default >/dev/null; then
-    die "$USERS_FILE 里没有账号 default（手机用的那条链接）：运行 edge user add default 重新创建"
+    [ "${KEYS_NEW:-0}" = 1 ] \
+        || die "$USERS_FILE 里没有账号 default（手机用的那条链接）：从备份恢复 xray/users.env，或者 edge user add default 新建（手机要重新导入）"
+    USER_NAMES+=(default) USER_UUIDS+=("$(gen_uuid)") USER_SSKEYS+=("$(gen_ss_key)")
+    USER_DATES+=("$(date +%F)") USER_EXITS+=(direct)
+    users_save
+    log "已创建账号 default（出口 direct）"
 fi
 if [ "$ROTATE" -eq 1 ]; then
     # REALITY 公钥和内网入口的服务端密钥都换了，所有链接本来就要重新导入，账号凭据一起换掉
@@ -280,17 +277,6 @@ else
     warn "本机还没有 $XRAY_IMAGE 镜像，跳过 Xray 配置检查"
 fi
 COMMITTED=1
-
-# ---------- 清理旧版数据（新配置已经检查通过，数据都在 users.env / exits.env 里了）----------
-if [ "$UPSTREAM_CLEANUP" -eq 1 ]; then
-    sed -i -E 's#^UPSTREAM=.*#UPSTREAM=#' "$EDGE_DIR/.env"
-    log ".env 里的 UPSTREAM 已迁移为出口 upstream，原来的值已清空（以后用 edge exit 管理出口）"
-fi
-rm -f "$UPSTREAM_MIGRATED"
-if [ -f "$RELAYS_FILE" ]; then
-    mv -f "$RELAYS_FILE" "$RELAYS_FILE.migrated"
-    log "通行证已迁移为账号，旧文件改名为 xray/relays.env.migrated（确认没问题后可以删除）"
-fi
 
 # ---------- 生效 / 下一步 ----------
 if [ "$EDGE_ROLE" = edge ]; then

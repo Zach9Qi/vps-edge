@@ -31,8 +31,6 @@
 #   edge exit add <名字> '<链接>' [--force]       添加出口：先测试，通过才保存
 #   edge exit update <名字> '<链接>' [--force]    更换出口的链接
 #   edge exit list | test <名字> | remove <名字>   查看 / 测试 / 删除出口（还有账号在用时不能删）
-#   edge upstream '<链接>' | test | off          旧命令：所有账号都走出口 upstream / 测试 / 取消
-#   edge relay ...                              旧命令：同 edge user
 #   edge internal                               查看 / 交互设置内网入口
 #   edge internal <内网IP:端口>                  开启或修改内网入口（给同一内网的入口机用）
 #   edge internal off                           关闭内网入口
@@ -1063,77 +1061,6 @@ cmd_exit() {
     esac
 }
 
-# ---------------------------------------------------------------- 旧命令：edge upstream / edge relay
-# edge upstream 保留旧版的意思："本机所有账号都走这个上游"。出口名固定叫 upstream
-cmd_upstream() {
-    load_env
-    need_installed
-    local a link="" force=0 i moved others=""
-    for a in "$@"; do
-        if [ "$a" = --force ]; then force=1; else link="$a"; fi
-    done
-    users_load
-    exits_load
-    case "$link" in
-        "")
-            if i="$(out_index upstream)"; then
-                log "出口 upstream：$(exit_desc upstream)"
-                echo "  链接：$(upstream_mask "${OUT_LINKS[$i]}")"
-                echo "  走它的账号：$(users_using upstream)"
-                echo "  测试：edge upstream test    取消：edge upstream off"
-            else
-                log "没有出口 upstream：edge upstream '<链接>' 设置后，所有账号都走它"
-            fi
-            echo "  每个账号单独指定出口：edge exit / edge user（或者 edge chain 打开菜单）" ;;
-        test)
-            out_index upstream >/dev/null || die "没有出口 upstream"
-            exit_test upstream ;;
-        off)
-            out_index upstream >/dev/null || { log "没有出口 upstream，不用取消"; return 0; }
-            moved="$(users_using upstream)"
-            if [ -n "$moved" ] && [ -t 0 ]; then
-                confirm "取消后这些账号改为本机直接出网：$moved，确定？" || { log "已取消"; return 0; }
-            fi
-            chain_backup
-            for i in "${!USER_NAMES[@]}"; do
-                if [ "${USER_EXITS[$i]}" = upstream ]; then USER_EXITS[$i]=direct; fi
-            done
-            i="$(out_index upstream)"
-            unset "OUT_NAMES[$i]" "OUT_LINKS[$i]"
-            users_save
-            exits_save
-            chain_apply "取消失败"
-            log "已删除出口 upstream${moved:+；这些账号改为本机直接出网：$moved}" ;;
-        *)
-            for i in "${!USER_NAMES[@]}"; do
-                case "${USER_EXITS[$i]}" in
-                    direct|upstream) ;;
-                    *) others+="${others:+ }${USER_NAMES[$i]}→${USER_EXITS[$i]}" ;;
-                esac
-            done
-            if [ -n "$others" ]; then
-                [ -t 0 ] || die "有账号走别的出口（$others）：edge upstream 会把所有账号都改走 upstream。只改某个账号请用 edge user set-exit"
-                confirm "所有账号都会改走 upstream，包括走别的出口的：$others，确定？" || die "已取消，配置没有改动"
-            fi
-            exit_check upstream "$link" "$force"
-            chain_backup
-            if i="$(out_index upstream)"; then OUT_LINKS[$i]="$link"; else OUT_NAMES+=(upstream) OUT_LINKS+=("$link"); fi
-            for i in "${!USER_NAMES[@]}"; do USER_EXITS[$i]=upstream; done
-            exits_save
-            users_save
-            chain_apply "启用失败"
-            if [ ${#USER_NAMES[@]} -gt 0 ]; then
-                log "已启用上游：所有账号（${USER_NAMES[*]}）都经 $UP_ADDR 出去，本机不再直连任何网站"
-            else
-                log "已保存出口 upstream（$UP_ADDR）：还没有账号，创建时选它（edge user add <名字> --exit upstream）"
-            fi
-            echo "  客户端的配置不用改，照常连本机" ;;
-    esac
-}
-
-# edge relay：旧版的"通行证"，现在就是账号
-cmd_relay() { cmd_user "$@"; }
-
 # ---------------------------------------------------------------- 内网入口
 cmd_internal() {
     load_env
@@ -1362,8 +1289,6 @@ case "$cmd" in
     chain)       menu_chain ;;
     user)        cmd_user "$@" ;;
     exit)        cmd_exit "$@" ;;
-    upstream)    cmd_upstream "$@" ;;
-    relay)       cmd_relay "$@" ;;
     internal)    cmd_internal "$@" ;;
     *)           usage; exit 1 ;;
 esac

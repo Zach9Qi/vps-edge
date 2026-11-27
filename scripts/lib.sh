@@ -38,7 +38,6 @@ load_env() {
     fi
     REALITY_SNI="${REALITY_SNI:-}"
     REALITY_CERT_DOMAIN="${REALITY_CERT_DOMAIN:-}"
-    UPSTREAM="${UPSTREAM:-}"
     EXIT_LISTEN="${EXIT_LISTEN:-}"
     NODE_NAME="${NODE_NAME:-edge-reality}"
     # 伪装站端口；兼容旧版 .env 里的 DECOY_UPSTREAM（3000 或 127.0.0.1:3000）
@@ -389,9 +388,6 @@ xray_exists() {  # xray 容器存在（不管是否在运行）
 # 出口（xray/exits.env）：每行 "名字 链接"，支持的链接见 upstream_parse
 USERS_FILE="$EDGE_DIR/xray/users.env"
 EXITS_FILE="$EDGE_DIR/xray/exits.env"
-# 旧版数据，只在迁移时读（见 chain_migrate）
-RELAYS_FILE="$EDGE_DIR/xray/relays.env"
-UPSTREAM_MIGRATED="$EDGE_DIR/xray/upstream.migrated"
 NAME_RE='^[A-Za-z0-9_-]{1,32}$'
 SS_METHOD="2022-blake3-aes-128-gcm"
 # 测出口 IP 用：Cloudflare 的 trace 页面，返回内容里有一行 ip=<访问者 IP>
@@ -497,7 +493,6 @@ exit_listen_check() {
 # ---------------------------------------------------------------- 账号（xray/users.env）
 users_load() {  # 读到数组 USER_NAMES / USER_UUIDS / USER_SSKEYS / USER_DATES / USER_EXITS
     local n u k d e rest
-    chain_migrate
     USER_NAMES=() USER_UUIDS=() USER_SSKEYS=() USER_DATES=() USER_EXITS=()
     [ -f "$USERS_FILE" ] || return 0
     while read -r n u k d e rest; do
@@ -597,55 +592,6 @@ exit_desc() {  # exit_desc <出口>：给人看的简介（不含密码；先 ex
     if [ "$1" = direct ]; then echo "本机直接出网"; return 0; fi
     if ! i="$(out_index "$1")"; then echo "（出口不存在）"; return 0; fi
     if upstream_parse "${OUT_LINKS[$i]}" 2>/dev/null; then echo "$UP_DESC"; else echo "（链接有问题）"; fi
-}
-
-# ---------------------------------------------------------------- 旧版数据迁移
-# chain_migrate：users.env 还不存在时，把旧版数据迁移过来（只做一次，UUID 和密钥原样保留，客户端不用重新导入）
-#   keys.env 的 XRAY_UUID → 账号 default（只有完整节点）
-#   relays.env 的每张通行证 → 同名账号
-#   .env 的 UPSTREAM      → 出口 upstream，所有账号都走它（和旧版"本机流量全部经上游"一样）
-# 不改 .env 和 relays.env：02-init.sh 生效成功后再清理（UPSTREAM 清空、relays.env 改名）
-chain_migrate() {
-    [ ! -f "$USERS_FILE" ] && [ -f "$KEYS_FILE" ] || return 0
-    local out=direct n u k d rest i uuid
-    if [ -n "${UPSTREAM:-}" ]; then
-        upstream_parse "$UPSTREAM" \
-            || die ".env 里 UPSTREAM 的链接不对（原因见上），没法迁移成出口：改对之后重新运行，或者清空 UPSTREAM 的值"
-        exits_load
-        if i="$(out_index upstream)"; then
-            [ "${OUT_LINKS[$i]}" = "$UPSTREAM" ] \
-                || die "$EXITS_FILE 里已经有出口 upstream，但链接和 .env 的 UPSTREAM 不一样：确认用哪个之后删掉另一个"
-        else
-            OUT_NAMES+=(upstream) OUT_LINKS+=("$UPSTREAM")
-            exits_save
-        fi
-        out=upstream
-        : >"$UPSTREAM_MIGRATED"   # 02-init.sh 看到它才会清空 .env 的 UPSTREAM
-    fi
-
-    USER_NAMES=() USER_UUIDS=() USER_SSKEYS=() USER_DATES=() USER_EXITS=()
-    if [ "${EDGE_ROLE:-edge}" = edge ]; then
-        uuid="$( . <(sed 's/\r$//' "$KEYS_FILE"); printf '%s' "${XRAY_UUID:-}")"
-        [[ "$uuid" =~ ^[0-9a-fA-F-]{36}$ ]] || uuid="$(gen_uuid)"
-        USER_NAMES+=(default) USER_UUIDS+=("$uuid") USER_SSKEYS+=("$(gen_ss_key)")
-        USER_DATES+=("$(date +%F)") USER_EXITS+=("$out")
-    fi
-    if [ -f "$RELAYS_FILE" ]; then
-        while read -r n u k d rest; do
-            if [ -z "$n" ] || [[ "$n" == \#* ]]; then continue; fi
-            [[ "$n" =~ $NAME_RE && "$u" =~ ^[0-9a-fA-F-]{36}$ && "$k" =~ ^[A-Za-z0-9+/=]{24}$ ]] \
-                || die "$RELAYS_FILE 里这一行格式不对：$n（应为：名字 UUID SS密钥 日期）"
-            if [ "$n" = default ]; then n=relay-default; fi
-            if user_index "$n" >/dev/null; then die "迁移失败：$RELAYS_FILE 里有重名的通行证 $n"; fi
-            USER_NAMES+=("$n") USER_UUIDS+=("$u") USER_SSKEYS+=("$k") USER_DATES+=("${d:--}") USER_EXITS+=("$out")
-        done < <(sed 's/\r$//' "$RELAYS_FILE")
-    fi
-    users_save
-    # 输出到 stderr：调用方可能在 $(...) 里，不能混进返回值
-    log "已建立账号列表 $USERS_FILE（${#USER_NAMES[@]} 个账号；原有的 UUID 和密钥不变，客户端不用重新导入）" >&2
-    if [ "$out" != direct ]; then
-        log "旧版的上游已迁移为出口 upstream，所有账号都走它（和以前一样）" >&2
-    fi
 }
 
 # ---------------------------------------------------------------- 按账号生成出口和路由

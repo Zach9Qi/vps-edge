@@ -126,7 +126,6 @@ vps-edge/                       → 上传到 VPS 的 /opt/edge
 | `edge exit ...` | 13 → 1~4 | 添加 / 查看测试 / 更换 / 删除出口（另一台机器、第三方代理），见 8.6 节 |
 | `edge user ...` | 13 → 5~9 | 添加 / 查看链接 / 改出口 / 测试 / 删除账号，每个账号走自己的出口，见 8.6 节 |
 | `edge internal ...` | 13 → 10~11 | 开启 / 修改 / 关闭内网入口（给同一内网的入口机用），见 8.6 节 |
-| `edge upstream ...` / `edge relay ...` | | 旧命令，仍然可用，见 8.6 节末尾 |
 
 内网出口模式（`EDGE_ROLE=exit`）的菜单只有和 Xray、链式代理有关的项，网站相关的命令（`add` / `up` / `remove` / `sites` / `logs nginx`）不可用。
 
@@ -553,14 +552,6 @@ edge exit add office  'https://用户名:密码@proxy.example.com:443'
 - `default` 不进内网入口。**除了 `default` 一个账号都没有时，内网入口不监听**：Shadowsocks 2022 在没有用户时会退化成单用户模式，只凭服务端密钥就能连，而被删除账号的入口机手里正好有这个密钥
 - 地址保存在 `.env` 的 `EXIT_LISTEN`；改了 IP 或端口后，已发出的内网链接都要重新导入
 
-#### 旧命令
-
-| 命令 | 现在的意思 |
-|---|---|
-| `edge upstream '<链接>'` | 添加 / 更换出口 `upstream`，并让**所有账号**都走它（和旧版"本机流量全部走上游"一样）。有账号走别的出口时会先确认，非交互运行直接拒绝 |
-| `edge upstream` / `test` / `off` | 查看 / 测试出口 `upstream`；`off` 把走它的账号改回 `direct` 并删掉它 |
-| `edge relay add / list / show / remove` | 同 `edge user` |
-
 ### 8.7 验证：流量真的从该走的出口出去了吗
 
 `edge exit add`、`edge exit test` 和 `edge check` 测出口；`edge user test` 测账号。做法一样：
@@ -608,22 +599,7 @@ edge exit add office  'https://用户名:密码@proxy.example.com:443'
 
 出口和路由由 `scripts/lib.sh` 的 `xray_egress` 生成，填进 `templates/xray/egress.json.tpl`。想加自定义规则可以改这个模板，但注意不要破坏上面"严格按账号走"的几条（第一个出口是 `block`、不要加回落）。
 
-### 8.9 从旧版升级
-
-升级后第一次运行任何会读账号的命令（`edge apply`、`edge client`、`edge chain`…）时自动迁移，**UUID 和密钥原样保留，客户端不用重新导入**：
-
-| 旧版 | 新版 |
-|---|---|
-| `keys.env` 的 `XRAY_UUID`（手机用的） | 账号 `default` |
-| `relays.env` 的每张通行证 | 同名账号（叫 `default` 的通行证改名为 `relay-default`） |
-| `.env` 的 `UPSTREAM` | 出口 `upstream`，**所有账号都走它**（和以前一样） |
-
-- 新配置生效成功后才清理旧数据：`.env` 的 `UPSTREAM` 清空，`relays.env` 改名为 `relays.env.migrated`（确认没问题后可以删除）。生效失败时什么都不会变
-- 迁移后再手动在 `.env` 里填 `UPSTREAM`，`edge apply` 会报错并告诉你改用什么命令，不会悄悄忽略
-- Xray 日志里通行证的流量从 `relay-<名字>@edge` 变成了 `<名字>@edge`
-- 改过旧模板 `egress-direct.json.tpl` 的，要把改动搬到 `templates/xray/egress.json.tpl`
-
-### 8.10 安全建议
+### 8.9 安全建议
 
 - **一台入口机、一个人一个账号**：某台入口机被攻破或链接泄露，只删它那一个账号，不用轮换密钥，其他设备也不用重新导入
 - **链接就是密码**：只发给对应的人或机器，不要贴到公开的地方
@@ -632,7 +608,7 @@ edge exit add office  'https://用户名:密码@proxy.example.com:443'
 - **http / socks5 出口是明文**，走公网时尽量换成 `https://` 或加密协议
 - 出口不在你手里（第三方）时，它能看到你访问了哪些域名；HTTPS 网页的内容它看不到
 
-### 8.11 常见问题
+### 8.10 常见问题
 
 | 现象 | 排查 |
 |---|---|
@@ -642,7 +618,6 @@ edge exit add office  'https://用户名:密码@proxy.example.com:443'
 | 某个账号上不了网，其他正常 | 它的出口挂了或链接失效：`edge user test <名字>` 看原因，`edge exit test <出口>` 单独测出口；急用时 `edge user set-exit <名字> <别的出口>` |
 | `edge user add` 提示"请用 --exit 指定" | 非交互运行、本机又有出口时，必须明确写出账号走哪个出口 |
 | `edge exit remove` 被拒绝 | 还有账号在用它：先 `edge user set-exit` 改到别的出口，或者删掉这些账号 |
-| `edge apply` 提示 UPSTREAM 不再使用 | `.env` 里手动填了 `UPSTREAM`：清空它，改用 `edge upstream '<链接>'` 或 `edge exit add` |
 | 内网入口没有监听 | 除了 `default` 还没有账号（故意不监听，见 8.6）；或者 `EXIT_LISTEN` 的 IP 不在本机网卡上（`ip -4 addr` 查看，WireGuard / Tailscale 的网卡要先起来） |
 | 经入口机打游戏、语音通话不通，网页正常 | UDP 不通：出口是 http / https 代理（不支持 UDP），或 socks5 出口没开 UDP，或内网入口的安全组没放行 UDP |
 
@@ -684,7 +659,7 @@ edge exit add office  'https://用户名:密码@proxy.example.com:443'
 | 后端 502 | 后端容器没起来，或者端口没有绑定在 `127.0.0.1:<端口>` |
 | 签发失败 | Token 权限、Zone Resources 是否包含该域名；`tail ~/.acme.sh/acme.sh.log` |
 
-多账号、链式代理相关的问题见 8.11 节。
+多账号、链式代理相关的问题见 8.10 节。
 
 ---
 
@@ -694,6 +669,6 @@ edge exit add office  'https://用户名:密码@proxy.example.com:443'
 - 走 `direct` 的账号屏蔽了 `geoip:private`，防止通过代理访问本机的 127.0.0.1 服务、所在内网和云厂商元数据接口，不要删除。走别的出口的账号这条规则由真正出网的那一跳负责（见 8.2 节）
 - 每个账号严格走自己的出口，出口挂了不会回落到本机直连（见 8.2 节）
 - `.env`、`xray/keys.env`、`xray/users.env`、`xray/exits.env`、`xray/config.json`、`certs/*/key.pem` 都是敏感文件（权限 600）
-- 多账号和链式代理的安全要点（账号、内网入口、明文出口）见 8.10 节
+- 多账号和链式代理的安全要点（账号、内网入口、明文出口）见 8.9 节
 - 伪装站要像一个真实网站：`apps/decoy/` 里放有正常内容的页面
 - 不开 80 端口：现代浏览器默认优先尝试 https，访问过一次后 HSTS 会让浏览器一直走 https；只有极少数手动输入 `http://` 的首次访问会连不上

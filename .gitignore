@@ -1,10 +1,8 @@
 # 敏感信息与运行时生成的文件
 .env
 xray/keys.env*
-xray/relays.env*
 xray/users.env*
 xray/exits.env*
-xray/upstream.migrated
 xray/config.json
 nginx/nginx.conf
 nginx/conf.d/00-decoy.conf
