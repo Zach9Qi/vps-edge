@@ -6,7 +6,6 @@ xray/exits.env*
 xray/config.json
 nginx/nginx.conf
 nginx/conf.d/00-decoy.conf
-nginx/removed/
 certs/
 logs/
 

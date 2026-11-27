@@ -618,8 +618,19 @@ rename_site() {  # rename_site <旧域名> <新域名> [Token]
     certs_offer_prune
 }
 
+# 节点改名中途失败或被中断时，把 .env 改回原来的三个值（记在变量里，不生成备份文件）
+RD_PENDING=0 RD_SNI="" RD_CERT="" RD_TOK=""
+rename_decoy_undo() {
+    [ "$RD_PENDING" = 1 ] || return 0
+    RD_PENDING=0
+    env_set REALITY_SNI "$RD_SNI"
+    env_set REALITY_CERT_DOMAIN "$RD_CERT"
+    env_set CF_Token "$RD_TOK"
+    warn "没改成功，.env 已恢复，节点还是 $RD_SNI"
+}
+
 rename_decoy() {  # rename_decoy <旧域名> <新域名> [Token]
-    local old="$1" new="$2" given="${3:-}" cert oldtok bak="$EDGE_DIR/.env.rename-bak"
+    local old="$1" new="$2" given="${3:-}" cert oldtok
     if [ -t 0 ]; then
         warn "$old 是节点（伪装站）的域名：改完以后所有客户端链接里的 SNI 都会变，要重新导入（UUID、公钥、shortId 不变）"
         confirm "把节点域名 $old 改成 $new？" || { log "已取消"; return 0; }
@@ -629,16 +640,17 @@ rename_decoy() {  # rename_decoy <旧域名> <新域名> [Token]
     add_pick_token "$new" "$given"
     cert="$(pick_cert_domain "$new" "$ADD_ZONE")"
 
-    cp -p "$EDGE_DIR/.env" "$bak"
+    RD_SNI="$(env_get REALITY_SNI)" RD_CERT="$(env_get REALITY_CERT_DOMAIN)" RD_TOK="$(env_get CF_Token)"
+    RD_PENDING=1
+    trap rename_decoy_undo EXIT
+    trap 'exit 130' INT TERM
     env_set REALITY_SNI "$new"
     env_set REALITY_CERT_DOMAIN "$cert"
     env_set CF_Token "$ADD_TOKEN"
     log ".env 已改成 REALITY_SNI=$new、REALITY_CERT_DOMAIN=$cert，开始生成配置"
-    if ! (apply_core); then
-        mv -f "$bak" "$EDGE_DIR/.env"
-        die "没改成功，.env 已恢复，节点还是 $old（原因见上面）"
-    fi
-    rm -f "$bak"
+    (apply_core) || die "节点域名没改成（原因见上面）"
+    RD_PENDING=0
+    trap - EXIT INT TERM
     load_env
     log "节点域名已从 $old 改成 $new。新的分享链接："
     bash "$S/show-client.sh" || true
@@ -1009,22 +1021,35 @@ certs_prune() {
 
 # certs_dry_run <根域名...>：把这些证书目录临时挪走，跑 nginx -t，然后马上挪回来。
 # 检查通过 = 没有这些证书 nginx 照样能加载配置，删掉不影响网站；不通过就退出，什么都不删
+DRY_TMP="" DRY_MOVED=()
+certs_dry_undo() {  # 把演练时挪走的证书目录挪回原处（可以重复调用）
+    local d
+    for d in "${DRY_MOVED[@]}"; do
+        if [ -d "$EDGE_DIR/certs/$DRY_TMP-$d" ]; then mv "$EDGE_DIR/certs/$DRY_TMP-$d" "$EDGE_DIR/certs/$d"; fi
+    done
+    DRY_MOVED=()
+}
+
 certs_dry_run() {
-    local d err rc tmp=".prune-check-$$" moved=()
+    local d err rc
     if ! nginx_running; then
         warn "nginx 没在运行，没法实际演练，只按配置文件检查过"
         return 0
     fi
     err="$(docker exec nginx nginx -t -q 2>&1)" \
         || die "nginx 现在的配置本身就检查不通过，先修好再清理证书：$err"
+    DRY_TMP=".prune-check-$$" DRY_MOVED=()
+    trap certs_dry_undo EXIT
+    trap 'exit 130' INT TERM
     for d in "$@"; do
         if [ -d "$EDGE_DIR/certs/$d" ]; then
-            mv "$EDGE_DIR/certs/$d" "$EDGE_DIR/certs/$tmp-$d"
-            moved+=("$d")
+            mv "$EDGE_DIR/certs/$d" "$EDGE_DIR/certs/$DRY_TMP-$d"
+            DRY_MOVED+=("$d")
         fi
     done
     err="$(docker exec nginx nginx -t -q 2>&1)" && rc=0 || rc=$?
-    for d in "${moved[@]}"; do mv "$EDGE_DIR/certs/$tmp-$d" "$EDGE_DIR/certs/$d"; done
+    certs_dry_undo
+    trap - EXIT INT TERM
     [ "$rc" -eq 0 ] || die "把 $* 的证书挪走后 nginx 配置检查不通过，说明还有地方在用，一个都没删：$err"
     log "演练通过：没有这些证书 nginx 配置照样正常，删除不影响现有网站"
 }
@@ -1059,10 +1084,12 @@ need_installed() {
     [ -f "$KEYS_FILE" ] || die "还没有安装：先运行 edge install"
 }
 
-# 改账号 / 出口之前先备份；重新生成配置失败时恢复原样（02-init.sh 自己会恢复 config.json）
+# 改账号 / 出口之前先在临时目录留一份；重新生成配置失败时恢复原样（02-init.sh 自己会恢复 config.json）
+# 临时目录在脚本退出时总会删掉，不会留在磁盘上
 chain_backup() {
     local f
     CHAIN_BAK="$(mktemp -d)"
+    trap 'rm -rf "$CHAIN_BAK"' EXIT
     for f in "$USERS_FILE" "$EXITS_FILE"; do
         if [ -f "$f" ]; then cp -p "$f" "$CHAIN_BAK/"; fi
     done

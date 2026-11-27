@@ -87,7 +87,7 @@ gen_x25519() {
         || die "生成 X25519 密钥失败：xray 镜像 $XRAY_IMAGE 拉取失败，且本机 openssl 不支持 X25519（需要 1.1.1 以上）"
 }
 
-# ---------- 备份当前配置：后面任何一步失败都恢复原样 ----------
+# ---------- 当前配置先复制到临时目录：后面任何一步失败都恢复原样，脚本退出时删掉 ----------
 # 否则坏配置会留在磁盘上：nginx 暂时还用着内存里的旧配置，
 # 但下次容器重启（VPS 重启、edge update）就起不来，网站和代理一起中断
 GENERATED=("$EDGE_DIR/nginx/nginx.conf" "$EDGE_DIR/nginx/conf.d/00-decoy.conf"
@@ -118,12 +118,10 @@ on_exit() {
 }
 trap on_exit EXIT
 
+# 轮换：删掉旧密钥重新生成。中途失败会从上面的临时目录恢复，成功后旧密钥不保留
 if [ "$ROTATE" -eq 1 ] && [ -f "$KEYS_FILE" ]; then
-    stamp="$(date +%Y%m%d%H%M%S)"
-    cp -p "$KEYS_FILE" "$KEYS_FILE.bak.$stamp"
-    if [ -f "$USERS_FILE" ]; then cp -p "$USERS_FILE" "$USERS_FILE.bak.$stamp"; fi
     rm -f "$KEYS_FILE"
-    warn "已备份并删除旧密钥，将重新生成"
+    warn "已删除旧密钥，将重新生成"
 fi
 
 if [ -f "$KEYS_FILE" ]; then
