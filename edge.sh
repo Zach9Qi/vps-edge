@@ -26,6 +26,7 @@
 #   edge user list                              查看账号和各自的出口
 #   edge user show <名字>                        再次显示链接
 #   edge user set-exit <名字> <出口>              修改账号的出口（链接不变）
+#   edge user rename <旧名字> <新名字>            给账号改名（链接照常能用）
 #   edge user test <名字>                        测试：流量是不是从该走的出口出去
 #   edge user remove <名字>                      删除账号（用它的设备立刻连不上，其他不受影响）
 #   edge exit add <名字> '<链接>' [--force]       添加出口：先测试，通过才保存
@@ -798,6 +799,7 @@ user_list() {
     done
     echo "  显示链接：edge user show <名字>    改出口：edge user set-exit <名字> <出口>"
     echo "  测试：    edge user test <名字>    删除：  edge user remove <名字>"
+    echo "  改名：    edge user rename <旧名字> <新名字>"
 }
 
 user_set_exit() {  # user_set_exit <名字> <出口>
@@ -827,6 +829,33 @@ user_set_exit() {  # user_set_exit <名字> <出口>
     chain_apply "修改失败"
     log "账号 $name 的出口：$cur → $out（$(exit_desc "$out")）"
     echo "  链接不变，客户端不用重新导入；验证：edge user test $name"
+}
+
+user_rename() {  # user_rename <旧名字> <新名字>：只改名字，UUID / 密钥 / 出口都不变，已发出的链接继续能用
+    local name="${1:-}" new="${2:-}" i
+    users_load
+    if [ -z "$name" ]; then
+        [ -t 0 ] || die "用法：edge user rename <旧名字> <新名字>"
+        pick_user name "改哪个账号的名字"
+    fi
+    i="$(user_index "$name")" || die "没有叫 $name 的账号（edge user list 查看）"
+    # default 是本机自带的账号（edge client 显示它，不进内网入口），配置生成按这个名字认它
+    [ "$name" != default ] || die "default 是本机自带的账号，不能改名"
+    if [ -z "$new" ]; then
+        [ -t 0 ] || die "用法：edge user rename <旧名字> <新名字>"
+        ask new "新名字（字母、数字、- _）"
+    fi
+    [[ "$new" =~ $NAME_RE ]] || die "名字只能用字母、数字、- 和 _，最长 32 个字符：$new"
+    [ "$new" != default ] || die "default 是保留名字，换一个"
+    if [ "$new" = "$name" ]; then log "名字没变，不用改"; return 0; fi
+    if user_index "$new" >/dev/null; then die "已经有叫 $new 的账号了"; fi
+    chain_backup
+    USER_NAMES[$i]="$new"
+    users_save
+    chain_apply "改名失败"
+    log "账号 $name 已改名为 $new"
+    echo "  UUID 和密钥不变，用旧链接的设备、入口机照常能连；"
+    echo "  客户端里显示的节点名还是旧的（$(link_name "$name")），想跟着改就重新导入：edge user show $new"
 }
 
 user_test() {  # user_test <名字>：模拟客户端用这个账号连本机，看流量是不是从该走的出口出去
@@ -889,9 +918,10 @@ cmd_user() {
                    fi
                    user_print "$name" ;;
         set-exit)  user_set_exit "$@" ;;
+        rename|mv) user_rename "$@" ;;
         test)      user_test "$@" ;;
         remove|rm) user_remove "$@" ;;
-        *)         die "用法：edge user add|list|show|set-exit|test|remove [名字]" ;;
+        *)         die "用法：edge user add|list|show|set-exit|rename|test|remove [名字]" ;;
     esac
 }
 
@@ -1145,9 +1175,10 @@ menu_chain() {
   7) 修改账号的出口
   8) 测试账号（流量是不是从该走的出口出去）
   9) 删除账号
+ 10) 修改账号的名字
   ---- 内网入口：给同一内网里的入口机用 ----
- 10) 开启 / 修改内网入口
- 11) 关闭内网入口
+ 11) 开启 / 修改内网入口
+ 12) 关闭内网入口
   0) 返回
 EOF
         read -rp "请选择: " c || return 0
@@ -1166,8 +1197,9 @@ EOF
             7) bash "$SELF" user set-exit ;;
             8) bash "$SELF" user test ;;
             9) bash "$SELF" user remove ;;
-            10) bash "$SELF" internal set ;;
-            11) confirm "关闭后入口机就不能走内网连本机了，确定？" && bash "$SELF" internal off ;;
+            10) bash "$SELF" user rename ;;
+            11) bash "$SELF" internal set ;;
+            12) confirm "关闭后入口机就不能走内网连本机了，确定？" && bash "$SELF" internal off ;;
             0|q|"") return 0 ;;
             *) warn "没有这个选项" ;;
         esac || true
