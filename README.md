@@ -29,7 +29,7 @@ edge add blog.example.com blog 发布 apps/blog（自动分配端口、构建启
 edge up blog                  改了 apps/blog 的代码后重新构建、重启
 edge theme                    切换伪装站主题（列出来按序号选）
 edge check                    健康检查
-edge client                   再看一次分享链接
+edge client                   再看一次分享链接（--all 连同其他账号的链接一起显示）
 edge chain                    账号 / 出口 / 内网入口菜单（多账号、链式代理）
 edge help                     所有命令
 ```
@@ -116,7 +116,7 @@ vps-edge/                       → 上传到 VPS 的 /opt/edge
 | `edge remove [域名]` | 4 | 删除网站，对应的应用没有其他网站在用时一并停止（目录保留） |
 | `edge sites` | 5 | 查看已有网站、各自的后端和应用 |
 | `edge check` | 1 | 检查容器、端口、证书剩余天数、伪装站、各站点、对外暴露的端口 |
-| `edge client` | 2 | 打印分享链接和 mihomo 配置片段 |
+| `edge client [--all]` | 2 | 打印 `default` 账号的分享链接和 mihomo 配置片段；`--all` 再列出其他每个账号的链接（公网 `vless://`，开了内网入口时还有内网 `ss://`） |
 | `edge apply` | 8 | 改了 `.env` 或模板之后重新生成配置，自动重载（密钥不变） |
 | `edge update` | 9 | 拉取 nginx / Xray 新镜像并重启，再 `edge up` 全部应用 |
 | `edge rotate-keys` | 11 | 轮换 Xray 密钥和所有账号的 UUID（所有链接都失效，需要重新导入） |
@@ -322,7 +322,7 @@ Token 被删除或权限被修改都会导致续期失败；`edge check` 会在�
 | **出口** | 账号的流量从哪出去。`direct` 是内置的：本机直接出网；其他出口都是一条链接：另一台本项目的机器、第三方节点或代理 | `edge exit` |
 | **内网入口** | 本机在内网 IP 上开的 Shadowsocks 2022 入口，给同一内网里的入口机用；只监听内网 IP，不对公网开放 | `edge internal` |
 
-完整节点自带账号 `default`，就是 `edge client` 显示的那条链接，不能删除。
+完整节点自带账号 `default`，就是 `edge client` 显示的那条链接，不能删除。其他账号的链接用 `edge user show <名字>` 单独看，或者 `edge client --all` 一次全部列出来。
 
 一个例子：A 在香港，B 是美国的完整节点，C 是和 A 在同一个 VPC 里的纯内网出口。手机导入 A 的三条链接，想走哪条路就选哪个节点：
 

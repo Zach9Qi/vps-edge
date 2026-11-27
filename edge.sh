@@ -12,7 +12,7 @@
 #   edge remove [域名]        删除网站，并停止对应的应用（不带参数会列出来让你选）
 #   edge sites               查看已有网站
 #   edge check               健康检查
-#   edge client              显示客户端配置 / 分享链接
+#   edge client [--all]      显示客户端配置 / 分享链接（--all 连同其他账号的链接一起显示）
 #   edge apply               改了 .env 或模板之后，重新生成配置并生效
 #   edge update              更新所有镜像并重启（包括 apps/ 下的应用）
 #   edge rotate-keys         轮换 Xray 密钥（旧客户端需要重新导入）
@@ -640,10 +640,6 @@ chain_apply() {  # chain_apply <失败时的说明>：重新生成配置并生�
         die "$1，已恢复原来的设置（原因见上）"
     fi
     rm -rf "$CHAIN_BAK"
-}
-
-link_name() {  # link_name <账号>：分享链接里显示的节点名
-    if [ "$1" = default ]; then printf '%s' "$NODE_NAME"; else printf '%s-%s' "$NODE_NAME" "$1"; fi
 }
 
 users_using() {  # users_using <出口>：走这个出口的账号名，空格分隔（先 users_load）
@@ -1312,7 +1308,7 @@ case "$cmd" in
     remove|rm)   cmd_remove "$@" ;;
     sites|ls)    cmd_sites ;;
     check)       bash "$S/check.sh" ;;
-    client)      bash "$S/show-client.sh" ;;
+    client)      bash "$S/show-client.sh" "$@" ;;
     apply)       bash "$S/02-init.sh" ;;
     update)      cmd_update ;;
     rotate-keys) cmd_rotate ;;

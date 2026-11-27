@@ -645,6 +645,10 @@ xray_egress() {
 }
 
 # ---------------------------------------------------------------- 分享链接
+link_name() {  # link_name <账号>：分享链接里显示的节点名（需要 load_env）
+    if [ "$1" = default ]; then printf '%s' "$NODE_NAME"; else printf '%s-%s' "$NODE_NAME" "$1"; fi
+}
+
 # vless_link <UUID> <节点名>：本机公网入口（REALITY）的分享链接（需要 load_keys）
 vless_link() {
     printf 'vless://%s@%s:443?encryption=none&flow=xtls-rprx-vision&security=reality&sni=%s&fp=chrome&pbk=%s&sid=%s&type=tcp&headerType=none&support-x25519mlkem768=1#%s' \
