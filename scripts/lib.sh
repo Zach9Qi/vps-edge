@@ -108,6 +108,81 @@ find_cert() {
     return 1
 }
 
+# ---------------------------------------------------------------- 证书清单（edge certs / check.sh 用）
+# 换域名以后旧证书不会自动删，acme.sh 会一直续签它。下面这些函数回答：每张证书谁在用、续签用哪个 Token。
+#
+# 续签用的 Token：edge 签证书时只给 acme.sh 传 CF_Token（不传 CF_Zone_ID），acme.sh 把它存成
+# ~/.acme.sh/account.conf 里的 SAVED_CF_Token：所有证书共用，最后一次签发的覆盖之前的；
+# cron 续签时没有 .env，用的就是它。域名自己的配置里有 CF_Token= 时以那个为准。
+ACME_HOME="$(dirname "$ACME")"
+ACME_ACCOUNT_CONF="$ACME_HOME/account.conf"
+
+# cert_users <根域名>：用这张证书的域名（伪装站 + 网站），每行一个；没人用输出空
+cert_users() {
+    local d="$1" f decoy="$EDGE_DIR/nginx/conf.d/00-decoy.conf"
+    if [ "$d" = "${REALITY_CERT_DOMAIN:-}" ]; then
+        echo "${REALITY_SNI:-}（伪装站）"
+    elif [ -f "$decoy" ] && grep -qF "/etc/nginx/certs/$d/" "$decoy"; then
+        # .env 已经改成新域名、还没 edge apply：nginx 现在用的仍是旧证书，不能当成没人用
+        echo "伪装站（正在用的配置还是它，改了 .env 还没 edge apply）"
+    fi
+    for f in "$EDGE_DIR"/nginx/conf.d/*.conf; do
+        [ -f "$f" ] && [ "$(basename "$f")" != 00-decoy.conf ] || continue
+        if grep -qF "/etc/nginx/certs/$d/" "$f"; then basename "$f" .conf; fi
+    done
+}
+
+# cert_all：edge 的证书（certs/ 下的目录名），每行一个
+cert_all() {
+    local p
+    for p in "$EDGE_DIR"/certs/*/; do [ -d "$p" ] && basename "$p"; done
+    return 0
+}
+
+# acme_only：acme.sh 在续签、但 certs/ 下没有的（多半是删了目录忘了停续签，或者你自己另外签的）
+acme_only() {
+    local p d
+    for p in "$ACME_HOME"/*_ecc/; do
+        [ -d "$p" ] || continue
+        d="$(basename "$p")"; d="${d%_ecc}"
+        [ -f "$p/$d.conf" ] && [ ! -d "$EDGE_DIR/certs/$d" ] && echo "$d"
+    done
+    return 0
+}
+
+acme_managed() { [ -f "$ACME_HOME/${1}_ecc/${1}.conf" ]; }   # acme_managed <根域名>：acme.sh 在续签它
+
+cert_days() {  # cert_days <根域名>：剩余天数；没有证书文件输出空
+    local f="$EDGE_DIR/certs/$1/fullchain.pem" end
+    [ -s "$f" ] || return 0
+    end="$(openssl x509 -in "$f" -noout -enddate | cut -d= -f2)"
+    echo $(( ($(date -d "$end" +%s) - $(date +%s)) / 86400 ))
+}
+
+acme_conf_get() {  # acme_conf_get <文件> <键>：读 acme.sh 配置里的值（去掉引号）
+    [ -f "$1" ] || return 0
+    { grep -E "^$2=" "$1" || true; } | tail -n 1 | cut -d= -f2- | sed -E "s/^'(.*)'$/\1/; s/^\"(.*)\"$/\1/"
+}
+
+acme_conf_set() {  # acme_conf_set <文件> <键> <值>：改写（没有就追加），先写临时文件再改名
+    local tmp
+    tmp="$(mktemp "$1.XXXXXX")"
+    { grep -vE "^$2=" "$1" 2>/dev/null || true; printf "%s='%s'\n" "$2" "$3"; } >"$tmp"
+    chmod 600 "$tmp"
+    mv "$tmp" "$1"
+}
+
+cert_token() {  # cert_token <根域名>：续签这张证书时用的 CF Token；不知道输出空
+    local t
+    t="$(acme_conf_get "$ACME_HOME/${1}_ecc/${1}.conf" CF_Token)"
+    [ -n "$t" ] || t="$(acme_conf_get "$ACME_ACCOUNT_CONF" SAVED_CF_Token)"
+    echo "$t"
+}
+
+mask_token() {  # mask_token <Token>：只露头尾 4 位
+    if [ ${#1} -gt 10 ]; then echo "${1:0:4}…${1: -4}"; elif [ -n "$1" ]; then echo "****"; fi
+}
+
 # 单独运行脚本时提示下一步；由 edge.sh 一键执行时（EDGE_ONECLICK=1）不提示
 next_step() {
     [ "${EDGE_ONECLICK:-0}" = 1 ] || log "下一步：$*"

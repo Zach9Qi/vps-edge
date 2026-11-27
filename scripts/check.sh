@@ -58,6 +58,13 @@ if [ "$EDGE_ROLE" = edge ]; then
         if   [ "$left" -lt 3 ];  then bad  "$d 剩余 $left 天（$end）"
         elif [ "$left" -lt 15 ]; then info "$d 剩余 $left 天，续期可能有问题：tail ~/.acme.sh/acme.sh.log"
         else ok "$d 剩余 $left 天"; fi
+        [ -n "$(cert_users "$d")" ] \
+            || info "$d 已经没有站点在用（换过域名？），acme.sh 还在续签它：确认不要了就 edge certs prune"
+        if acme_managed "$d"; then
+            tok="$(cert_token "$d")"
+            [ -z "$tok" ] || [ -z "$CF_Token" ] || [ "$tok" = "$CF_Token" ] \
+                || info "$d 续签用的 Token 和 .env 里的不一样（换过 Token？）：edge certs token"
+        fi
     done
     crontab -l 2>/dev/null | grep -q acme.sh && ok "acme.sh 续期 cron 存在" || bad "root 的 crontab 里没有 acme.sh 续期任务"
 

@@ -122,6 +122,9 @@ vps-edge/                       → 上传到 VPS 的 /opt/edge
 | `edge rotate-keys` | 11 | 轮换 Xray 密钥和所有账号的 UUID（所有链接都失效，需要重新导入） |
 | `edge logs [nginx\|xray]` | | 实时查看日志 |
 | `edge xray [--raw]` | 12 | 查看 Xray 实际配置（私钥、密码默认隐藏，`--raw` 显示完整），并提示配置是否已生效 |
+| `edge certs` | 14 | 查看每张证书：哪些域名在用、剩余天数、自动续签用哪个 Cloudflare Token，见 7.1 节 |
+| `edge certs prune [根域名...] [--revoke]` | 14 → 1 | 停止自动续签并删除没有站点在用的证书（不带域名 = 全部没人用的；`--revoke` 同时注销） |
+| `edge certs token` | 14 → 2 | 把 `.env` 里的新 `CF_Token` 交给自动续签（先检查它能管理所有在用证书的域名） |
 | `edge chain` | 13 | 账号 / 出口 / 内网入口菜单 |
 | `edge exit ...` | 13 → 1~4 | 添加 / 查看测试 / 更换 / 删除出口（另一台机器、第三方代理），见 8.6 节 |
 | `edge user ...` | 13 → 5~10 | 添加 / 查看链接 / 改出口 / 测试 / 删除 / 改名账号，每个账号走自己的出口，见 8.6 节 |
@@ -287,7 +290,7 @@ stream 分流规则和 Xray 配置都不用改：不是伪装站域名的流量�
 |---|---|
 | 定时任务 | acme.sh 安装时会在 root 的 crontab 里加一条每日任务（`crontab -l` 可以看到） |
 | 验证方式 | DNS-01：通过 Cloudflare API 写 `_acme-challenge` TXT 记录，验证完自动删除，只有出站请求 |
-| 凭据 | `CF_Token` 第一次签发时保存在 `~/.acme.sh/account.conf` |
+| 凭据 | 签发时用的 `CF_Token` 保存在 `~/.acme.sh/account.conf`（`SAVED_CF_Token`），**所有证书共用一个，最后一次签发用的覆盖之前的**；续签只用它，不读 `.env` |
 | 安装 | 新证书写到 `certs/<根域名>/`，nginx 以只读方式挂载 |
 | 生效 | 执行 `scripts/reload-nginx.sh`：先 `nginx -t` 检查，再平滑 reload |
 
@@ -306,7 +309,34 @@ export TELEGRAM_BOT_APITOKEN="..." TELEGRAM_BOT_CHATID="..."
 ~/.acme.sh/acme.sh --set-notify --notify-hook telegram --notify-level 2
 ```
 
-Token 被删除或权限被修改都会导致续期失败；`edge check` 会在证书剩余不足 15 天时报警。
+Token 被删除或权限被修改都会导致续期失败；`edge check` 会在证书剩余不足 15 天时报警，有证书没人用、续签 Token 和 `.env` 不一致时也会提醒。
+
+### 7.1 换域名、换 Cloudflare Token
+
+证书按根域名签（`X` 和 `*.X`），换了域名以后**旧证书不会自动删掉**，acme.sh 会一直续签它，旧域名从 Cloudflare 删掉之后就一直续签失败；换了 `CF_Token` 以后，**续签用的还是 acme.sh 存下来的旧 Token**。`edge certs`（菜单 14）处理这两件事：
+
+```
+$ edge certs
+== 证书（按根域名，每张覆盖 X 和 *.X）==
+  new.com                      剩余 89 天  自动续签，Token abcd…wxyz
+      在用：www.new.com（伪装站）
+      在用：blog.new.com
+  old.com                      剩余 41 天  自动续签，Token 1234…5678（≠ .env）
+      没有站点在用
+```
+
+把伪装站域名（`REALITY_SNI`）换成另一个根域名、同时换 Token 的完整步骤：
+
+1. Cloudflare：新建 Token（`Zone → DNS → Edit`、`Zone → Zone → Read`），Zone Resources 选新域名，**以及所有还要继续用的根域名**；给新域名加灰云 A/AAAA 记录
+2. 改 `.env`：`CF_Token`、`REALITY_SNI`、`REALITY_CERT_DOMAIN`
+3. `edge apply`：新根域名还没有证书，会用新 Token 自动签发
+4. 旧根域名下还有网站的，先 `edge add <新域名> <应用名>` 再 `edge remove <旧域名>`
+5. `edge client` 拿新链接，客户端重新导入（或者只把 SNI 改成新域名，UUID、公钥、shortId 不变）
+6. `edge certs prune`：列出没人用的证书，确认后停止续签并删除
+7. `edge certs token`：检查新 Token 能管理每张在用证书的域名，通过才写进 acme.sh 的续签设置
+8. `edge certs` 里没有 `≠ .env` 之后，到 Cloudflare 删掉旧 Token 和旧域名的 DNS 记录
+
+只换网站域名（同一个根域名下）不涉及证书，第 4 步就够了。旧证书一般不需要注销，停止续签后 90 天内自然过期；怀疑私钥泄露时才用 `edge certs prune <根域名> --revoke`。
 
 ---
 

@@ -19,6 +19,11 @@
 #   edge logs [nginx|xray]   查看日志
 #   edge xray [--raw]        查看 Xray 实际配置（私钥默认隐藏，--raw 显示完整）
 #
+#   ---- 证书（换了域名 / 换了 Cloudflare Token 之后用）----
+#   edge certs                          查看每张证书：谁在用、剩余天数、续签用哪个 Token
+#   edge certs prune [根域名...] [--revoke]  停止续签并删除没人用的证书（不带域名 = 全部没人用的）
+#   edge certs token                    把 .env 里的新 CF_Token 交给自动续签（先检查它能管理所有在用的域名）
+#
 #   ---- 账号和出口（多账号、链式代理，详见 README 第 8 节）----
 #   每个账号一条链接，各走各的出口：direct = 本机直接出网，或者另一台机器 / 第三方代理
 #   edge chain                                  打开账号 / 出口菜单
@@ -604,6 +609,161 @@ cmd_logs() {
         xray)  docker logs -f --tail 100 xray ;;
         *)     die "用法：edge logs [nginx|xray]" ;;
     esac
+}
+
+# ================================================================ 证书
+# 换了域名以后旧证书不会自动删掉，acme.sh 会一直续签它（旧域名删掉后就一直续签失败）；
+# 换了 CF Token 以后，续签用的还是 acme.sh 存下来的旧 Token。edge certs 管这两件事，
+# 数据怎么存见 scripts/lib.sh 的"证书清单"一节。
+cmd_certs() {
+    need_edge_role
+    load_env
+    case "${1:-list}" in
+        list|ls)  certs_list ;;
+        prune|rm) shift; certs_prune "$@" ;;
+        token)    certs_token ;;
+        *)        die "用法：edge certs [list] | edge certs prune [根域名...] [--revoke] | edge certs token" ;;
+    esac
+}
+
+certs_list() {
+    local d days users tok renew unused=() other env_tok="$CF_Token" diff=0
+    echo "== 证书（按根域名，每张覆盖 X 和 *.X）=="
+    while read -r d; do
+        [ -n "$d" ] || continue
+        days="$(cert_days "$d")"
+        if acme_managed "$d"; then
+            tok="$(cert_token "$d")"
+            renew="自动续签，Token $(mask_token "$tok")"
+            if [ -n "$tok" ] && [ -n "$env_tok" ] && [ "$tok" != "$env_tok" ]; then
+                renew="$renew（≠ .env）"; diff=1
+            fi
+        else
+            renew="acme.sh 没在续签，到期就失效"
+        fi
+        printf '  %-28s 剩余 %s 天  %s\n' "$d" "${days:-?}" "$renew"
+        users="$(cert_users "$d")"
+        if [ -n "$users" ]; then
+            sed 's/^/      在用：/' <<<"$users"
+        else
+            echo "      没有站点在用"
+            unused+=("$d")
+        fi
+    done < <(cert_all)
+
+    other="$(acme_only)"
+    if [ -n "$other" ]; then
+        echo
+        echo "== acme.sh 还在续签、但 edge 没有在用的 =="
+        sed 's/^/  /' <<<"$other"
+        echo "  （如果是你自己另外签的就别管；是 edge 以前签的可以 edge certs prune <根域名> 停掉）"
+    fi
+
+    echo
+    echo "  .env 里的 CF Token：$(mask_token "$env_tok")"
+    if [ ${#unused[@]} -gt 0 ]; then
+        warn "${#unused[@]} 张证书没有站点在用：${unused[*]}"
+        warn "  确认不要了：edge certs prune（停止自动续签并删除；加 --revoke 同时注销）"
+    fi
+    if [ "$diff" = 1 ]; then
+        warn "自动续签用的 Token 和 .env 里的不一样。换过 Token 的话运行 edge certs token"
+    fi
+}
+
+# certs_prune [根域名...] [--revoke]：不带域名 = 所有没有站点在用的证书
+certs_prune() {
+    local revoke=0 a d u list=()
+    for a in "$@"; do
+        case "$a" in
+            --revoke) revoke=1 ;;
+            -*)       die "不认识的参数：$a" ;;
+            *)        list+=("$a") ;;
+        esac
+    done
+    if [ ${#list[@]} -eq 0 ]; then
+        while read -r d; do
+            [ -n "$d" ] && [ -z "$(cert_users "$d")" ] && list+=("$d")
+        done < <(cert_all)
+        [ ${#list[@]} -gt 0 ] || { log "每张证书都有站点在用，没有要清理的"; return 0; }
+        echo "这些证书已经没有站点在用："
+        printf '  %s\n' "${list[@]}"
+        [ -t 0 ] || die "不在终端里运行时要写明删哪些：edge certs prune ${list[*]}"
+    fi
+    # 先全部检查一遍，有一个不能删就一个都不动
+    for d in "${list[@]}"; do
+        [[ "$d" =~ $DOMAIN_RE ]] || die "域名格式不对：$d"
+        u="$(cert_users "$d" | paste -sd' ')"
+        [ -z "$u" ] || die "$d 的证书还在用：$u（先把这些网站换成新域名或 edge remove，伪装站改 .env 后 edge apply）"
+        [ -d "$EDGE_DIR/certs/$d" ] || acme_managed "$d" || die "没有 $d 的证书（edge certs 查看）"
+    done
+    if [ -t 0 ]; then
+        if [ "$revoke" = 1 ]; then
+            confirm "注销并删除 ${list[*]} 的证书（停止自动续签）？" || { log "已取消"; return 0; }
+        else
+            confirm "停止自动续签并删除 ${list[*]} 的证书？" || { log "已取消"; return 0; }
+        fi
+    fi
+    for d in "${list[@]}"; do cert_drop "$d" "$revoke"; done
+    log "完成：edge certs 查看剩下的证书。旧域名的 DNS 记录和 Token 要到 Cloudflare 上自己删"
+}
+
+cert_drop() {  # cert_drop <根域名> <注销 0|1>
+    local d="$1"
+    if acme_managed "$d"; then
+        if [ "$2" = 1 ]; then
+            # 注销要用 acme.sh 目录里的证书文件，所以必须在 --remove / 删除之前
+            if "$ACME" --revoke -d "$d" --ecc; then log "$d 的证书已注销"
+            else warn "注销 $d 失败，继续删除（不注销的话 90 天内到期自然失效）"; fi
+        fi
+        if "$ACME" --remove -d "$d" --ecc >/dev/null; then log "$d 已停止自动续签"
+        else warn "acme.sh --remove $d 失败，仍然删除它的目录（续签任务就找不到它了）"; fi
+        rm -rf "${ACME_HOME:?}/${d}_ecc"
+    elif [ "$2" = 1 ]; then
+        warn "$d 不归 acme.sh 管理，没法注销，只删除文件"
+    fi
+    if [ -d "$EDGE_DIR/certs/$d" ]; then
+        rm -rf "${EDGE_DIR:?}/certs/$d"
+        log "已删除 certs/$d"
+    fi
+}
+
+# certs_token：把 .env 里的 CF_Token 交给自动续签。先确认它能管理所有在用证书的域名，不能就不改
+certs_token() {
+    local t="$CF_Token" d f zone rc bad=() unused=()
+    [ -n "$t" ] || die ".env 里 CF_Token 为空"
+    [[ "$t" =~ ^[A-Za-z0-9_-]+$ ]] || die ".env 里的 CF_Token 有奇怪的字符，检查是不是复制多了空格或引号"
+    [ -x "$ACME" ] || die "还没有安装 acme.sh：先运行 edge install"
+    log "检查 .env 里的 Token（$(mask_token "$t")）能不能续签每张在用的证书"
+    while read -r d; do
+        [ -n "$d" ] || continue
+        if [ -z "$(cert_users "$d")" ]; then unused+=("$d"); continue; fi
+        rc=0; zone="$(cf_zone_of "$d")" || rc=$?
+        case "$rc" in
+            0) printf '  OK  %-28s（Cloudflare 上的域名：%s）\n' "$d" "$zone" ;;
+            1) printf '  ✗   %-28s 这个 Token 看不到它\n' "$d"; bad+=("$d") ;;
+            3) die "Token 无效或权限不够：需要 Zone → Zone → Read 和 Zone → DNS → Edit" ;;
+            *) die "查询 Cloudflare 失败（网络不通，或者没装 jq），稍后再试" ;;
+        esac
+    done < <(cert_all)
+    if [ ${#bad[@]} -gt 0 ]; then
+        die "新 Token 续签不了 ${bad[*]}：到 Cloudflare 把它们加进这个 Token 的 Zone Resources；已经不用的先换掉网站再 edge certs prune。续签设置没有改"
+    fi
+
+    [ -f "$ACME_ACCOUNT_CONF" ] || die "找不到 $ACME_ACCOUNT_CONF（acme.sh 没装好？运行 edge install）"
+    cp -p "$ACME_ACCOUNT_CONF" "$ACME_ACCOUNT_CONF.bak"
+    acme_conf_set "$ACME_ACCOUNT_CONF" SAVED_CF_Token "$t"
+    # 直接写在 account.conf 里的 CF_Token= 会被 acme.sh 当成环境变量读进去，优先级比 SAVED_ 高，去掉
+    sed -i '/^CF_Token=/d' "$ACME_ACCOUNT_CONF"
+    # edge 的证书里单独存过 Token 的（用了 CF_Zone_ID 时 acme.sh 会这样存），也一起换掉；你自己另外签的不动
+    while read -r d; do
+        f="$ACME_HOME/${d}_ecc/$d.conf"
+        [ -n "$d" ] && [ -f "$f" ] && grep -q '^CF_Token=' "$f" && acme_conf_set "$f" CF_Token "$t"
+    done < <(cert_all)
+    log "已更新：以后自动续签都用这个 Token（旧设置备份在 $ACME_ACCOUNT_CONF.bak）"
+    log "确认 edge certs 里没有 ≠ .env 之后，旧 Token 可以到 Cloudflare 删掉了"
+    if [ ${#unused[@]} -gt 0 ]; then
+        warn "${unused[*]} 没有站点在用，新 Token 可能续签不了它们，到时会一直报错：确认不要了就 edge certs prune"
+    fi
 }
 
 # ================================================================ 账号 / 出口 / 内网入口
@@ -1222,6 +1382,7 @@ menu_edge() {
  11) 轮换 Xray 密钥
  12) 查看 Xray 配置
  13) 账号 / 出口 / 内网入口（多账号、链式代理）
+ 14) 证书（换了域名 / Token 后清理旧证书、同步 Token）
   0) 退出
 EOF
         read -rp "请选择: " c || exit 0
@@ -1243,6 +1404,14 @@ EOF
             11) bash "$SELF" rotate-keys ;;
             12) bash "$SELF" xray ;;
             13) menu_chain ;;
+            14) bash "$SELF" certs
+                echo
+                echo "  1) 清理没有站点在用的证书    2) 把 .env 里的 CF Token 交给自动续签    留空 = 返回"
+                read -rp "请选择: " a
+                case "$a" in
+                    1) bash "$SELF" certs prune ;;
+                    2) bash "$SELF" certs token ;;
+                esac ;;
             0|q|"") exit 0 ;;
             *) warn "没有这个选项" ;;
         esac || true
@@ -1314,6 +1483,7 @@ case "$cmd" in
     rotate-keys) cmd_rotate ;;
     logs)        cmd_logs "$@" ;;
     xray)        cmd_xray "$@" ;;
+    certs|cert)  cmd_certs "$@" ;;
     chain)       menu_chain ;;
     user)        cmd_user "$@" ;;
     exit)        cmd_exit "$@" ;;
