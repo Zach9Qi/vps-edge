@@ -108,28 +108,42 @@ find_cert() {
     return 1
 }
 
-# ---------------------------------------------------------------- 证书清单（edge certs / check.sh 用）
-# 换域名以后旧证书不会自动删，acme.sh 会一直续签它。下面这些函数回答：每张证书谁在用、续签用哪个 Token。
+# ---------------------------------------------------------------- 证书清单（edge certs / edge apply / check.sh 用）
+# 证书按根域名签（X 和 *.X），换了域名以后旧证书不会自动删，acme.sh 会一直续签它。
+# 下面这些函数回答：每张证书谁在用、续签用哪个 Token。
 #
-# 续签用的 Token：edge 签证书时只给 acme.sh 传 CF_Token（不传 CF_Zone_ID），acme.sh 把它存成
-# ~/.acme.sh/account.conf 里的 SAVED_CF_Token：所有证书共用，最后一次签发的覆盖之前的；
-# cron 续签时没有 .env，用的就是它。域名自己的配置里有 CF_Token= 时以那个为准。
+# 续签用的 Token：每张证书各存一份，写在 ~/.acme.sh/<根域名>_ecc/<根域名>.conf 的 CF_Token / CF_Zone_ID。
+# acme.sh 续签时先读 account.conf、再读这个文件（后读的优先），每张证书在单独的子进程里续签，
+# 所以不同证书的 Token 可以不一样，互不覆盖。edge 签证书时同时传 CF_Token 和 CF_Zone_ID，
+# acme.sh 就会存到这里（只传 CF_Token 才会存成 account.conf 里所有证书共用的 SAVED_CF_Token）。
+# .env 里的 CF_Token 永远是 REALITY_CERT_DOMAIN 最新的 Token：edge apply 先检查它能管理这个域名，
+# 不能就拒绝；能就和同一个根域名的证书现在续签用的比一下，不一样才改。其他根域名的证书各自存的 Token 不动。
+#
+# 一个域名该用哪个 Token，看它自己的根域名（token_for_domain）：
+#   和 REALITY_CERT_DOMAIN 同一个根域名 → .env 的 CF_Token
+#   其他根域名 → 那个根域名的证书自己存的 Token（edge add 第一次签它的证书时你给的）
 ACME_HOME="$(dirname "$ACME")"
 ACME_ACCOUNT_CONF="$ACME_HOME/account.conf"
 
-# cert_users <根域名>：用这张证书的域名（伪装站 + 网站），每行一个；没人用输出空
+# cert_users <根域名>：用这张证书的地方（伪装站、网站、其他配置），每行一个；没人用输出空
 cert_users() {
-    local d="$1" f decoy="$EDGE_DIR/nginx/conf.d/00-decoy.conf"
+    local d="$1" f decoy="$EDGE_DIR/nginx/conf.d/00-decoy.conf" ref="/etc/nginx/certs/$1/"
     if [ "$d" = "${REALITY_CERT_DOMAIN:-}" ]; then
         echo "${REALITY_SNI:-}（伪装站）"
-    elif [ -f "$decoy" ] && grep -qF "/etc/nginx/certs/$d/" "$decoy"; then
+    elif [ -f "$decoy" ] && grep -qF "$ref" "$decoy"; then
         # .env 已经改成新域名、还没 edge apply：nginx 现在用的仍是旧证书，不能当成没人用
         echo "伪装站（正在用的配置还是它，改了 .env 还没 edge apply）"
     fi
     for f in "$EDGE_DIR"/nginx/conf.d/*.conf; do
         [ -f "$f" ] && [ "$(basename "$f")" != 00-decoy.conf ] || continue
-        if grep -qF "/etc/nginx/certs/$d/" "$f"; then basename "$f" .conf; fi
+        if grep -qF "$ref" "$f"; then basename "$f" .conf; fi
     done
+    # 手动改过的 nginx 主配置 / 公共片段、自己写的 compose 里引用了它，也算在用
+    for f in "$EDGE_DIR"/nginx/nginx.conf "$EDGE_DIR"/nginx/snippets/* \
+             "$EDGE_DIR"/apps/*/compose.y*ml "$EDGE_DIR"/apps/*/docker-compose.y*ml; do
+        if [ -f "$f" ] && grep -qF "certs/$d/" "$f"; then echo "${f#"$EDGE_DIR"/}"; fi
+    done
+    return 0
 }
 
 # cert_all：edge 的证书（certs/ 下的目录名），每行一个
@@ -139,18 +153,63 @@ cert_all() {
     return 0
 }
 
+# cert_unused：edge 的证书里没有任何地方在用的，每行一个
+cert_unused() {
+    local d
+    while read -r d; do
+        if [ -n "$d" ] && [ -z "$(cert_users "$d")" ]; then echo "$d"; fi
+    done < <(cert_all)
+    return 0
+}
+
 # acme_only：acme.sh 在续签、但 certs/ 下没有的（多半是删了目录忘了停续签，或者你自己另外签的）
 acme_only() {
     local p d
     for p in "$ACME_HOME"/*_ecc/; do
         [ -d "$p" ] || continue
         d="$(basename "$p")"; d="${d%_ecc}"
-        [ -f "$p/$d.conf" ] && [ ! -d "$EDGE_DIR/certs/$d" ] && echo "$d"
+        if [ -f "$p/$d.conf" ] && [ ! -d "$EDGE_DIR/certs/$d" ]; then echo "$d"; fi
     done
     return 0
 }
 
-acme_managed() { [ -f "$ACME_HOME/${1}_ecc/${1}.conf" ]; }   # acme_managed <根域名>：acme.sh 在续签它
+# same_root_as_env <域名>：和 .env 的 REALITY_CERT_DOMAIN 是同一个根域名（就是它，或者是它的子域名）
+same_root_as_env() {
+    [ -n "${REALITY_CERT_DOMAIN:-}" ] || return 1
+    case "$1" in "$REALITY_CERT_DOMAIN"|*".$REALITY_CERT_DOMAIN") return 0 ;; esac
+    return 1
+}
+
+# cert_root_of <域名>：certs/ 下和它同一个根域名的证书（就是它，或者它是证书域名的子域名），有多个取最长的
+cert_root_of() {
+    local r best=""
+    while read -r r; do
+        [ -n "$r" ] || continue
+        case "$1" in "$r"|*".$r") if [ ${#r} -gt ${#best} ]; then best="$r"; fi ;; esac
+    done < <(cert_all)
+    [ -n "$best" ] && echo "$best"
+}
+
+# token_for_domain <域名>：这个域名该用的 Cloudflare Token（规则见上）；不知道输出空
+token_for_domain() {
+    local root
+    if same_root_as_env "$1"; then echo "${CF_Token:-}"; return 0; fi
+    root="$(cert_root_of "$1")" || return 0
+    acme_conf_get "$(acme_conf "$root")" CF_Token
+}
+
+# cf_token_err <返回码> <域名>：cf_token_zone 失败的原因
+cf_token_err() {
+    case "$1" in
+        1) echo "看不到 $2，确认域名托管在 Cloudflare，且 Token 的 Zone Resources 包含它" ;;
+        3) echo "Token 无效或缺少 Zone → Zone → Read 权限" ;;
+        4) echo "能看到 $2，但没有 Zone → DNS → Edit 权限" ;;
+        *) echo "连不上 Cloudflare API（或者没装 jq，运行 edge install 会补装）" ;;
+    esac
+}
+
+acme_conf() { echo "$ACME_HOME/${1}_ecc/${1}.conf"; }    # acme_conf <根域名>：acme.sh 里这张证书的配置文件
+acme_managed() { [ -f "$(acme_conf "$1")" ]; }           # acme_managed <根域名>：acme.sh 在续签它
 
 cert_days() {  # cert_days <根域名>：剩余天数；没有证书文件输出空
     local f="$EDGE_DIR/certs/$1/fullchain.pem" end
@@ -174,9 +233,19 @@ acme_conf_set() {  # acme_conf_set <文件> <键> <值>：改写（没有就追�
 
 cert_token() {  # cert_token <根域名>：续签这张证书时用的 CF Token；不知道输出空
     local t
-    t="$(acme_conf_get "$ACME_HOME/${1}_ecc/${1}.conf" CF_Token)"
+    t="$(acme_conf_get "$(acme_conf "$1")" CF_Token)"
+    [ -n "$t" ] || t="$(acme_conf_get "$ACME_ACCOUNT_CONF" CF_Token)"
     [ -n "$t" ] || t="$(acme_conf_get "$ACME_ACCOUNT_CONF" SAVED_CF_Token)"
     echo "$t"
+}
+
+cert_set_token() {  # cert_set_token <根域名> <Token> <zone_id>：这张证书以后续签用这个 Token（只改它自己）
+    local f
+    f="$(acme_conf "$1")"
+    [ -f "$f" ] || return 1
+    acme_conf_set "$f" CF_Token "$2"
+    # 必须一起写：只有 Token 没有 Zone ID 时，acme.sh 续签会把 Token 存成所有证书共用的那份
+    acme_conf_set "$f" CF_Zone_ID "$3"
 }
 
 mask_token() {  # mask_token <Token>：只露头尾 4 位
@@ -222,6 +291,19 @@ cf_zone_of() {
     [ "$rc" -eq 0 ] && echo "${out#* }"
     return "$rc"
 }
+
+# cf_token_zone <Token> <域名>：这个 Token 能不能管理域名所在的 zone，能就打印 "<zone_id> <zone_name>"
+# 返回 0 能；1 看不到；2 网络或 jq 问题；3 Token 无效；4 看得到但没有 DNS 权限
+cf_token_zone() {
+    local out rc resp
+    out="$(CF_Token="$1" cf_zone_lookup "$2")" && rc=0 || rc=$?
+    [ "$rc" -eq 0 ] || return "$rc"
+    resp="$(curl -sS --max-time 15 -H "Authorization: Bearer $1" \
+            "https://api.cloudflare.com/client/v4/zones/${out%% *}/dns_records?per_page=1" 2>/dev/null)" || return 2
+    jq -e '.success == true' >/dev/null 2>&1 <<<"$resp" || return 4
+    echo "$out"
+}
+
 
 # public_ipv4 / public_ipv6：获取本机公网出口 IP（缓存到进程内变量，批量补齐时只查一次）
 _PUB_IPV4_DONE=0 _PUB_IPV4=""
@@ -294,9 +376,12 @@ _cf_ensure_one() {
 # ensure_dns_record <域名>：确保该域名在 Cloudflare 上有指向本机的灰云 A（及按 ENABLE_IPV6 决定的 AAAA）记录
 # 失败只打印 warn 不退出，避免网络抖动或外部独立管理的域名卡死站点创建/重载
 ensure_dns_record() {
-    local domain="$1" out zid rc ip4="" ip6="" want_v6=0
-    if [ -z "${CF_Token:-}" ]; then
-        warn ".env 未填写 CF_Token，跳过自动创建 $domain 的 DNS 记录"
+    local domain="$1" out zid rc tok ip4="" ip6="" want_v6=0
+    # 用这个域名自己的 Token：和伪装站同一个根域名用 .env 的，其他根域名用它那张证书存的（只在本函数内有效）
+    tok="$(token_for_domain "$domain")"
+    local CF_Token="$tok"
+    if [ -z "$CF_Token" ]; then
+        warn "没有 $domain 所在根域名的 Cloudflare Token，跳过自动创建 DNS 记录"
         return 1
     fi
     if ! command -v jq >/dev/null; then
@@ -326,6 +411,35 @@ ensure_dns_record() {
     [ -n "$ip4" ] && _cf_ensure_one "$zid" "$domain" A "$ip4" || true
     [ -n "$ip6" ] && _cf_ensure_one "$zid" "$domain" AAAA "$ip6" || true
     return 0
+}
+
+# cf_delete_records <域名> <Token>：删掉这个域名指向本机的 A / AAAA 记录（指向别处的不动），换域名后清理旧域名用
+cf_delete_records() {
+    local domain="$1" out zid rtype ip resp id n=0
+    local CF_Token="$2"
+    [ -n "$CF_Token" ] || { warn "没有 $domain 的 Cloudflare Token，DNS 记录没删"; return 1; }
+    command -v jq >/dev/null || { warn "没有 jq，DNS 记录没删"; return 1; }
+    out="$(cf_zone_lookup "$domain")" || { warn "查不到 $domain 所在的 Cloudflare 域名，DNS 记录没删"; return 1; }
+    zid="${out%% *}"
+    for rtype in A AAAA; do
+        if [ "$rtype" = A ]; then ip="$(public_ipv4 || true)"; else ip="$(public_ipv6 || true)"; fi
+        [ -n "$ip" ] || continue
+        resp="$(curl -sS --max-time 15 -H "Authorization: Bearer $CF_Token" \
+                "https://api.cloudflare.com/client/v4/zones/$zid/dns_records?name=$domain&type=$rtype&content=$ip" 2>/dev/null)" \
+            && jq -e '.success == true' >/dev/null 2>&1 <<<"$resp" \
+            || { warn "查询 $domain 的 $rtype 记录失败，没删"; return 1; }
+        while read -r id; do
+            [ -n "$id" ] || continue
+            if curl -sS --max-time 15 -X DELETE -H "Authorization: Bearer $CF_Token" \
+                    "https://api.cloudflare.com/client/v4/zones/$zid/dns_records/$id" 2>/dev/null \
+                    | jq -e '.success == true' >/dev/null 2>&1; then
+                log "已删除 DNS $rtype 记录 $domain → $ip"; n=$((n + 1))
+            else
+                warn "删除 $domain 的 $rtype 记录失败（Token 要有 Zone → DNS → Edit 权限）"
+            fi
+        done < <(jq -r '.result[].id' <<<"$resp")
+    done
+    [ "$n" -gt 0 ] || log "$domain 没有指向本机的 DNS 记录，不用删"
 }
 
 # ensure_all_sites_dns：为伪装站 + 所有已发布业务站点补齐灰云 DNS 记录（edge install / edge apply 时自动调用）

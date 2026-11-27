@@ -7,22 +7,24 @@
 #   edge install             一键安装 / 修复（可重复执行，不会重复生成密钥）
 #   edge add <域名> <应用名>  发布 apps/<应用名>：自动分配端口、构建启动、签证书、配好 HTTPS
 #   edge add <域名> <端口>    或者反代到一个已经在运行的服务
+#                            新的根域名（和 .env 不一样）会问你要它的 Token；不在终端里时加 --token <Token>
 #   edge up [应用名]          改了应用代码后重新构建、重启（不带参数 = 全部应用）
 #   edge theme [主题名]       切换伪装站主题（不带参数会列出来让你选）
 #   edge remove [域名]        删除网站，并停止对应的应用（不带参数会列出来让你选）
+#   edge rename [旧域名] [新域名]  网站或节点（伪装站）换域名：先上线新域名、确认能访问，再删旧的
 #   edge sites               查看已有网站
 #   edge check               健康检查
 #   edge client [--all]      显示客户端配置 / 分享链接（--all 连同其他账号的链接一起显示）
-#   edge apply               改了 .env 或模板之后，重新生成配置并生效
+#   edge apply               改了 .env 或模板之后，重新生成配置并生效（先检查 Token，再更新续签 Token、清理旧证书）
 #   edge update              更新所有镜像并重启（包括 apps/ 下的应用）
 #   edge rotate-keys         轮换 Xray 密钥（旧客户端需要重新导入）
 #   edge logs [nginx|xray]   查看日志
 #   edge xray [--raw]        查看 Xray 实际配置（私钥默认隐藏，--raw 显示完整）
 #
-#   ---- 证书（换了域名 / 换了 Cloudflare Token 之后用）----
+#   ---- 证书（每张证书续签用自己存的 Token；.env 里的 CF_Token 管和 REALITY_CERT_DOMAIN 同一个根域名的）----
+#   edge apply 先检查 .env 的 Token 能管理它的域名（不能就拒绝），续签 Token 不一样才改；没人用的旧证书会问你要不要删
 #   edge certs                          查看每张证书：谁在用、剩余天数、续签用哪个 Token
-#   edge certs prune [根域名...] [--revoke]  停止续签并删除没人用的证书（不带域名 = 全部没人用的）
-#   edge certs token                    把 .env 里的新 CF_Token 交给自动续签（先检查它能管理所有在用的域名）
+#   edge certs prune [根域名...] [--revoke]  停止续签并删除没人用的证书（先演练，确认不影响网站才删）
 #
 #   ---- 账号和出口（多账号、链式代理，详见 README 第 8 节）----
 #   每个账号一条链接，各走各的出口：direct = 本机直接出网，或者另一台机器 / 第三方代理
@@ -341,11 +343,14 @@ cmd_install() {
     if [ "$(env_get EDGE_ROLE)" = exit ]; then install_exit; return; fi
 
     log "[3/5] 证书"
+    load_env
+    env_token_check
     bash "$S/03-issue-cert.sh"
 
     log "[4/5] 生成密钥和配置、启动应用"
     bash "$S/02-init.sh"          # 里面会启动伪装站 apps/decoy
     load_env
+    env_token_sync                # 伪装站证书续签用 .env 里的 Token
     start_published_apps          # 已经 edge add 过的应用（换机器恢复时用得上）
 
     log "[5/5] 启动容器"
@@ -406,9 +411,18 @@ list_apps() {  # apps/ 下可以发布的应用（不含伪装站 decoy）
 cmd_add() {
     need_edge_role
     load_env
-    local domain="${1:-}" target="${2:-}" cert zone up app="" port="" new_app=0 apps
+    local domain="" target="" given="" cert up app="" port="" new_app=0 issue=0 apps
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --token)   [ $# -ge 2 ] || die "--token 后面要跟 Token"; given="$2"; shift ;;
+            --token=*) given="${1#--token=}" ;;
+            -*)        die "不认识的参数：$1" ;;
+            *)         if [ -z "$domain" ]; then domain="$1"; elif [ -z "$target" ]; then target="$1"; else die "多余的参数：$1"; fi ;;
+        esac
+        shift
+    done
     if [ -z "$domain" ] || [ -z "$target" ]; then
-        [ -t 0 ] || die "用法：edge add <域名> <应用名|端口>"
+        [ -t 0 ] || die "用法：edge add <域名> <应用名|端口> [--token <Token>]"
         ask domain "网站域名（如 app.你的域名.com）" "$domain"
         apps="$(list_apps | tr '\n' ' ')"
         echo "  apps/ 下的应用：${apps:-（没有）}"
@@ -418,6 +432,13 @@ cmd_add() {
     [ "$domain" != "$REALITY_SNI" ] \
         || die "$domain 是伪装站域名，由 apps/decoy 提供，不需要再添加"
     [ ! -e "$CONF_DIR/$domain.conf" ] || die "$domain 已经添加过了（edge sites 查看；要重建先 edge remove $domain）"
+
+    # 还没有覆盖它的证书：先定好用哪个 Token、签哪张证书（不行就在这里停，应用还没启动）
+    if ! cert="$(find_cert "$domain")"; then
+        add_pick_token "$domain" "$given"
+        cert="$(pick_cert_domain "$domain" "$ADD_ZONE")"
+        issue=1
+    fi
 
     # 第二个参数：apps/ 下的应用名 → 自动分配端口并启动；端口或 host:port → 直接反代
     if [ "$target" = decoy ]; then
@@ -438,16 +459,225 @@ cmd_add() {
 
     # 后面任何一步失败：刚为这次新启动的应用一并停掉，不留下没人用的容器
     if ! {
-        if ! cert="$(find_cert "$domain")"; then
-            zone="$(cf_zone_of "$domain")" || zone=""
-            cert="$(pick_cert_domain "$domain" "$zone")"
+        if [ "$issue" = 1 ]; then
             log "还没有覆盖 $domain 的证书，自动签发 $cert 和 *.$cert"
-            bash "$S/03-issue-cert.sh" "$cert"
+            ISSUE_CF_TOKEN="$ADD_TOKEN" bash "$S/03-issue-cert.sh" "$cert"
         fi &&
         bash "$S/add-site.sh" "$domain" "$up" "$cert" "$app"
     }; then
         [ "$new_app" -eq 0 ] || app_down "$app" || true
         die "添加 $domain 失败（见上面的报错）"
+    fi
+}
+
+# add_pick_token <域名> [Token]：edge add 签证书用哪个 Token，结果放在 ADD_TOKEN / ADD_ZONE（zone 名）
+#   命令行给了 --token                            → 用它
+#   和 .env 的 REALITY_CERT_DOMAIN 同一个根域名    → .env 的 CF_Token
+#   已经有这个根域名的证书（a.b.shop.org 之于 shop.org）→ 那张证书自己存的 Token
+#   都不是（新的根域名）                          → 让你粘贴一个，签证书后存在这张证书里，不写进 .env
+# 选出来的 Token 先查一次 Cloudflare，确认能管理这个域名才用
+ADD_TOKEN="" ADD_ZONE=""
+add_pick_token() {
+    local d="$1" tok="${2:-}" from="" root out rc
+    if [ -n "$tok" ]; then
+        from="命令行给的 Token"
+    elif same_root_as_env "$d"; then
+        tok="$CF_Token"; from=".env 的 CF_Token（和伪装站同一个根域名 $REALITY_CERT_DOMAIN）"
+    elif root="$(cert_root_of "$d")"; then
+        tok="$(acme_conf_get "$(acme_conf "$root")" CF_Token)"; from="$root 证书存的 Token"
+    fi
+    if [ -n "$tok" ]; then
+        out="$(cf_token_zone "$tok" "$d")" && rc=0 || rc=$?
+        if [ "$rc" -eq 0 ]; then
+            ADD_TOKEN="$tok"; ADD_ZONE="${out#* }"
+            log "$d 用 $from（$(mask_token "$tok")）"
+            return 0
+        fi
+        # .env 和命令行的 Token 是你明确指定的，不能用就停；证书里存的可能过期了，可以重新给一个
+        case "$from" in
+            .env*|命令行*) die "$from 不能用来签 $d：$(cf_token_err "$rc" "$d")。什么都没改" ;;
+        esac
+        warn "$from 不能用了：$(cf_token_err "$rc" "$d")"
+    else
+        warn "$d 的根域名和 .env 里的 $REALITY_CERT_DOMAIN 不一样，也还没有它的证书，要用能管理它的 Cloudflare Token"
+    fi
+    [ -t 0 ] || die "不在终端里运行时，在命令最后加 --token <能管理 $d 的 Token>"
+    while :; do
+        tok=""
+        read -rsp "粘贴能管理 $d 的 Cloudflare Token（Zone → DNS → Edit、Zone → Zone → Read；直接回车取消）: " tok; echo
+        [ -n "$tok" ] || die "已取消，什么都没改"
+        out="$(cf_token_zone "$tok" "$d")" && rc=0 || rc=$?
+        if [ "$rc" -eq 0 ]; then
+            ADD_TOKEN="$tok"; ADD_ZONE="${out#* }"
+            log "Token 能管理 $d（Cloudflare 上的 $ADD_ZONE），签证书后存在这张证书里，以后续签就用它"
+            return 0
+        fi
+        warn "$(cf_token_err "$rc" "$d")，请重新粘贴"
+    done
+}
+
+# ================================================================ 换域名
+# edge rename <旧域名> <新域名> [--token <Token>]
+#   网站：复制旧的站点配置，只改 server_name 和证书路径（手动改过的内容原样保留）→ 新域名上线 →
+#         本机确认 https://新域名 能访问 → 删除旧域名的站点。任何一步失败都撤回，旧域名照常
+#   节点（伪装站，REALITY_SNI）：改 .env 的 REALITY_SNI / REALITY_CERT_DOMAIN（新根域名还会换 CF_Token）
+#         → 走一遍 edge apply；失败就恢复 .env，节点照常
+#   最后：旧域名指向本机的 DNS 记录、没人用的旧证书，都问你要不要删
+#   新域名用哪个 Token 和 edge add 一样（add_pick_token）
+cmd_rename() {
+    need_edge_role
+    load_env
+    local old="" new="" given="" sites n i
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --token)   [ $# -ge 2 ] || die "--token 后面要跟 Token"; given="$2"; shift ;;
+            --token=*) given="${1#--token=}" ;;
+            -*)        die "不认识的参数：$1" ;;
+            *)         if [ -z "$old" ]; then old="$1"; elif [ -z "$new" ]; then new="$1"; else die "多余的参数：$1"; fi ;;
+        esac
+        shift
+    done
+    if [ -z "$old" ]; then
+        [ -t 0 ] || die "用法：edge rename <旧域名> <新域名> [--token <Token>]"
+        mapfile -t sites < <(echo "$REALITY_SNI"; list_sites)
+        for i in "${!sites[@]}"; do
+            if [ "$i" -eq 0 ]; then printf '  %d) %s（节点 / 伪装站）\n' 1 "${sites[0]}"
+            else printf '  %d) %s\n' $((i + 1)) "${sites[$i]}"; fi
+        done
+        read -rp "改哪个（序号）: " n
+        [[ "$n" =~ ^[0-9]+$ ]] && [ "$n" -ge 1 ] && [ "$n" -le ${#sites[@]} ] || die "序号不对"
+        old="${sites[$((n - 1))]}"
+    fi
+    if [ -z "$new" ]; then
+        [ -t 0 ] || die "用法：edge rename <旧域名> <新域名> [--token <Token>]"
+        ask new "$old 改成什么域名"
+    fi
+    [[ "$new" =~ $DOMAIN_RE ]] || die "域名格式不对：$new"
+    [ "$new" != "$old" ] || die "新旧域名一样"
+    [ "$new" != "$REALITY_SNI" ] || die "$new 是节点（伪装站）现在的域名"
+    [ ! -e "$CONF_DIR/$new.conf" ] || die "$new 已经是一个网站了（edge sites 查看）"
+    if [ "$old" = "$REALITY_SNI" ]; then
+        rename_decoy "$old" "$new" "$given"
+    else
+        rename_site "$old" "$new" "$given"
+    fi
+}
+
+rename_site() {  # rename_site <旧域名> <新域名> [Token]
+    local old="$1" new="$2" given="${3:-}" conf newconf oldcert cert issue=0 oldtok code
+    conf="$CONF_DIR/$old.conf"
+    [ -f "$conf" ] || die "没有 $old 这个网站（edge sites 查看）"
+    oldtok="$(token_for_domain "$old")"   # 删旧域名的 DNS 记录要用，旧证书删掉之前先记下
+    oldcert="$({ grep -oE '/etc/nginx/certs/[^/]+/' "$conf" || true; } | head -n 1 | cut -d/ -f5)"
+    if ! cert="$(find_cert "$new")"; then
+        add_pick_token "$new" "$given"
+        cert="$(pick_cert_domain "$new" "$ADD_ZONE")"
+        issue=1
+    fi
+    if [ -t 0 ]; then
+        confirm "把网站 $old 改成 $new？（先上线新域名，确认能访问后再删旧的）" || { log "已取消"; return 0; }
+    fi
+    if [ "$issue" = 1 ]; then
+        log "还没有覆盖 $new 的证书，自动签发 $cert 和 *.$cert"
+        ISSUE_CF_TOKEN="$ADD_TOKEN" bash "$S/03-issue-cert.sh" "$cert"
+    fi
+
+    # 1. 新域名上线：复制旧配置，只改域名和证书路径
+    newconf="$CONF_DIR/$new.conf"
+    site_conf_rename "$conf" "$old" "$new" "$oldcert" "$cert" >"$newconf"
+    if ! grep -qF "/etc/nginx/certs/$cert/" "$newconf" || ! grep -qE "server_name[^;]*[[:space:]]$new[[:space:];]" "$newconf"; then
+        rm -f "$newconf"
+        die "$old 的站点配置不是 edge 生成的格式（找不到 server_name $old 或证书路径），没法自动改名：手动 edge add $new 再 edge remove $old"
+    fi
+    log "已生成 $newconf（从 $old 复制，证书：$cert）"
+    if nginx_running; then
+        if ! bash "$S/reload-nginx.sh"; then
+            rm -f "$newconf"
+            die "nginx 配置检查不通过，已撤销，$old 照常"
+        fi
+    else
+        warn "nginx 没在运行，没法确认新域名能访问"
+    fi
+    ensure_dns_record "$new" || true
+
+    # 2. 确认新域名能访问：本机直连（不用等 DNS 生效），同时验证证书
+    if nginx_running; then
+        code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 10 --resolve "$new:443:127.0.0.1" "https://$new/" 2>/dev/null)" || true
+        if [ -z "$code" ] || [ "$code" = 000 ]; then
+            rm -f "$newconf"
+            bash "$S/reload-nginx.sh" >/dev/null || true
+            die "https://$new 在本机访问不通（证书或配置有问题），已撤销，$old 照常"
+        fi
+        log "https://$new 本机访问正常（HTTP $code）"
+    fi
+
+    # 3. 删掉旧域名（对应的应用新域名还在用，不会停）
+    bash "$S/remove-site.sh" "$old"
+    log "网站已从 $old 改成 $new"
+    dns_offer_cleanup "$old" "$oldtok"
+    certs_offer_prune
+}
+
+rename_decoy() {  # rename_decoy <旧域名> <新域名> [Token]
+    local old="$1" new="$2" given="${3:-}" cert oldtok bak="$EDGE_DIR/.env.rename-bak"
+    if [ -t 0 ]; then
+        warn "$old 是节点（伪装站）的域名：改完以后所有客户端链接里的 SNI 都会变，要重新导入（UUID、公钥、shortId 不变）"
+        confirm "把节点域名 $old 改成 $new？" || { log "已取消"; return 0; }
+    fi
+    oldtok="$CF_Token"
+    # .env 的 Token 永远跟着节点域名走：新根域名用你给的 Token，同根域名还用 .env 的
+    add_pick_token "$new" "$given"
+    cert="$(pick_cert_domain "$new" "$ADD_ZONE")"
+
+    cp -p "$EDGE_DIR/.env" "$bak"
+    env_set REALITY_SNI "$new"
+    env_set REALITY_CERT_DOMAIN "$cert"
+    env_set CF_Token "$ADD_TOKEN"
+    log ".env 已改成 REALITY_SNI=$new、REALITY_CERT_DOMAIN=$cert，开始生成配置"
+    if ! (apply_core); then
+        mv -f "$bak" "$EDGE_DIR/.env"
+        die "没改成功，.env 已恢复，节点还是 $old（原因见上面）"
+    fi
+    rm -f "$bak"
+    load_env
+    log "节点域名已从 $old 改成 $new。新的分享链接："
+    bash "$S/show-client.sh" || true
+    dns_offer_cleanup "$old" "$oldtok"
+    certs_offer_prune
+}
+
+# site_conf_rename <conf> <旧域名> <新域名> <旧证书> <新证书>：输出改好域名的站点配置
+#   只改 server_name 行和注释里的旧域名（整词匹配），以及证书路径；其他手动改过的内容原样保留
+site_conf_rename() {
+    OLD="$2" NEW="$3" OC="/etc/nginx/certs/$4/" NC="/etc/nginx/certs/$5/" awk '
+        function swap(s, a, b,    out, i, pre, post) {
+            out = ""
+            while ((i = index(s, a)) > 0) {
+                pre = (i > 1) ? substr(s, i - 1, 1) : ""
+                post = substr(s, i + length(a), 1)
+                if (pre !~ /[A-Za-z0-9.-]/ && post !~ /[A-Za-z0-9.-]/) out = out substr(s, 1, i - 1) b
+                else out = out substr(s, 1, i - 1 + length(a))
+                s = substr(s, i + length(a))
+            }
+            return out s
+        }
+        BEGIN { o = ENVIRON["OLD"]; n = ENVIRON["NEW"]; oc = ENVIRON["OC"]; nc = ENVIRON["NC"] }
+        /^[ \t]*server_name[ \t]/ || (/^[ \t]*#/ && !/^# app=/) { $0 = swap($0, o, n) }
+        { if (oc != nc && oc != "/etc/nginx/certs//") while ((i = index($0, oc)) > 0) $0 = substr($0, 1, i - 1) nc substr($0, i + length(oc)); print }
+    ' "$1"
+}
+
+# dns_offer_cleanup <旧域名> <Token>：旧域名已经不用了，问要不要删掉它指向本机的 DNS 记录
+dns_offer_cleanup() {
+    local d="$1" tok="$2"
+    [ ! -e "$CONF_DIR/$d.conf" ] && [ "$d" != "$REALITY_SNI" ] || return 0   # 还在用就不问
+    echo
+    if [ -z "$tok" ]; then
+        log "旧域名 $d 的 DNS 记录请到 Cloudflare 上自己删（不知道它用哪个 Token）"
+    elif [ -t 0 ] && confirm "删除 Cloudflare 上 $d 指向本机的 DNS 记录（指向别处的不动）？"; then
+        cf_delete_records "$d" "$tok" || warn "DNS 记录没删干净，到 Cloudflare 上看一下"
+    else
+        log "暂不删除。旧域名 $d 的 DNS 记录以后到 Cloudflare 上删"
     fi
 }
 
@@ -550,6 +780,8 @@ cmd_remove() {
         confirm "确认删除 $domain？" || { log "已取消"; return 0; }
     fi
     bash "$S/remove-site.sh" "$domain"
+    load_env
+    certs_offer_prune
 }
 
 cmd_update() {
@@ -612,22 +844,82 @@ cmd_logs() {
 }
 
 # ================================================================ 证书
-# 换了域名以后旧证书不会自动删掉，acme.sh 会一直续签它（旧域名删掉后就一直续签失败）；
-# 换了 CF Token 以后，续签用的还是 acme.sh 存下来的旧 Token。edge certs 管这两件事，
-# 数据怎么存见 scripts/lib.sh 的"证书清单"一节。
+# 证书按根域名签，每张证书续签用自己存的 Cloudflare Token（见 scripts/lib.sh 的"证书清单"一节）。
+# .env 里的 CF_Token 和 REALITY_CERT_DOMAIN 永远是最新的，edge apply 会：
+#   1. 先检查这个 Token 能不能管理这个域名，不能就拒绝，什么都不改（env_token_check）
+#   2. 能就看这个域名的证书现在续签用的 Token 是不是它，不是才改（env_token_sync）；其他证书不动
+#   3. 换了域名以后没人用的旧证书，先检查不影响现有网站，再问你要不要删（certs_offer_prune）
 cmd_certs() {
     need_edge_role
     load_env
     case "${1:-list}" in
-        list|ls)  certs_list ;;
+        list|ls)  certs_list; [ ! -t 0 ] || certs_offer_prune ;;
         prune|rm) shift; certs_prune "$@" ;;
-        token)    certs_token ;;
-        *)        die "用法：edge certs [list] | edge certs prune [根域名...] [--revoke] | edge certs token" ;;
+        *)        die "用法：edge certs [list] | edge certs prune [根域名...] [--revoke]" ;;
     esac
 }
 
+# cmd_apply：检查 .env 的 Token 和域名 → 重新生成配置并生效 → 更新续签 Token → 问要不要清理没人用的证书
+cmd_apply() {
+    if [ "$(env_get EDGE_ROLE)" = exit ]; then bash "$S/02-init.sh"; return; fi
+    apply_core
+    certs_offer_prune
+}
+
+apply_core() {  # 检查 Token → 生成配置并生效 → 更新续签 Token（失败直接退出）
+    load_env
+    env_token_check
+    # 在 if / 子 shell 里调用时 set -e 不生效，这里明确退出
+    bash "$S/02-init.sh" || die "生成配置失败（原因见上面）"
+    load_env
+    env_token_sync
+}
+
+# env_token_check：.env 里的 CF_Token 能不能管理 REALITY_CERT_DOMAIN；能就记下 zone id（ENV_ZONE_ID），不能直接退出
+ENV_ZONE_ID=""
+env_token_check() {
+    local d="$REALITY_CERT_DOMAIN" out rc
+    is_example "$REALITY_SNI" && die ".env 里还是示例域名，请先改 REALITY_SNI / REALITY_CERT_DOMAIN。未做任何改动"
+    cert_covers "$REALITY_SNI" "$d" \
+        || die "REALITY_SNI=$REALITY_SNI 不在 $d 泛域名证书的覆盖范围内，REALITY_CERT_DOMAIN 是不是忘了改？未做任何改动"
+    [ -n "$CF_Token" ] || die ".env 里 CF_Token 为空。未做任何改动"
+    out="$(cf_token_zone "$CF_Token" "$d")" && rc=0 || rc=$?
+    case "$rc" in
+        0) ENV_ZONE_ID="${out%% *}"
+           log ".env 里的 Token（$(mask_token "$CF_Token")）能管理 $d（Cloudflare 上的 ${out#* }）" ;;
+        1) die ".env 里的 Token 看不到 $d：确认域名托管在 Cloudflare，且 Token 的 Zone Resources 包含它。未做任何改动" ;;
+        3) die ".env 里的 Token 无效或缺少 Zone → Zone → Read 权限。未做任何改动" ;;
+        4) die ".env 里的 Token 能看到 $d，但没有 Zone → DNS → Edit 权限。未做任何改动" ;;
+        *) die "连不上 Cloudflare API（或者没装 jq），没法确认 .env 里的 Token。未做任何改动，稍后再试" ;;
+    esac
+}
+
+# env_token_sync：和 .env 同一个根域名的证书（伪装站的，还有 a.b.<根域名> 这类单独签的），续签 Token
+# 和 .env 不一样才改（先 env_token_check）。其他根域名的证书用它们自己存的，不动
+env_token_sync() {
+    local d conf cur curzid
+    [ -n "$ENV_ZONE_ID" ] || return 0
+    while read -r d; do
+        [ -n "$d" ] && same_root_as_env "$d" || continue
+        if ! acme_managed "$d"; then
+            warn "$d 的证书不归 acme.sh 管，不会自动续签：bash $S/03-issue-cert.sh $d 重新签一次"
+            continue
+        fi
+        conf="$(acme_conf "$d")"
+        cur="$(acme_conf_get "$conf" CF_Token)"
+        curzid="$(acme_conf_get "$conf" CF_Zone_ID)"
+        if [ "$cur" = "$CF_Token" ] && [ "$curzid" = "$ENV_ZONE_ID" ]; then
+            log "$d 续签用的 Token 和 .env 一致，不用改"
+        else
+            [ -n "$cur" ] || cur="$(cert_token "$d")"
+            cert_set_token "$d" "$CF_Token" "$ENV_ZONE_ID"
+            log "$d 续签 Token 已更新为 .env 里的（$(mask_token "$CF_Token")），原来是 $(mask_token "$cur")"
+        fi
+    done < <(cert_all)
+}
+
 certs_list() {
-    local d days users tok renew unused=() other env_tok="$CF_Token" diff=0
+    local d days users tok renew other
     echo "== 证书（按根域名，每张覆盖 X 和 *.X）=="
     while read -r d; do
         [ -n "$d" ] || continue
@@ -635,76 +927,106 @@ certs_list() {
         if acme_managed "$d"; then
             tok="$(cert_token "$d")"
             renew="自动续签，Token $(mask_token "$tok")"
-            if [ -n "$tok" ] && [ -n "$env_tok" ] && [ "$tok" != "$env_tok" ]; then
-                renew="$renew（≠ .env）"; diff=1
+            if same_root_as_env "$d"; then
+                if [ "$(acme_conf_get "$(acme_conf "$d")" CF_Token)" = "$CF_Token" ]; then
+                    renew="$renew（和 .env 一致）"
+                else
+                    renew="$renew（≠ .env，edge apply 检查通过后会更新）"
+                fi
+            else
+                renew="$renew（自己的根域名，用它自己存的）"
             fi
         else
             renew="acme.sh 没在续签，到期就失效"
         fi
         printf '  %-28s 剩余 %s 天  %s\n' "$d" "${days:-?}" "$renew"
         users="$(cert_users "$d")"
-        if [ -n "$users" ]; then
-            sed 's/^/      在用：/' <<<"$users"
-        else
-            echo "      没有站点在用"
-            unused+=("$d")
-        fi
+        if [ -n "$users" ]; then sed 's/^/      在用：/' <<<"$users"; else echo "      没有站点在用"; fi
     done < <(cert_all)
 
     other="$(acme_only)"
     if [ -n "$other" ]; then
         echo
-        echo "== acme.sh 还在续签、但 edge 没有在用的 =="
+        echo "== acme.sh 还在续签、但不在 certs/ 下的 =="
         sed 's/^/  /' <<<"$other"
-        echo "  （如果是你自己另外签的就别管；是 edge 以前签的可以 edge certs prune <根域名> 停掉）"
+        echo "  （你自己另外签的就别管；是 edge 以前签的可以 edge certs prune <根域名> 停掉）"
     fi
-
     echo
-    echo "  .env 里的 CF Token：$(mask_token "$env_tok")"
-    if [ ${#unused[@]} -gt 0 ]; then
-        warn "${#unused[@]} 张证书没有站点在用：${unused[*]}"
-        warn "  确认不要了：edge certs prune（停止自动续签并删除；加 --revoke 同时注销）"
-    fi
-    if [ "$diff" = 1 ]; then
-        warn "自动续签用的 Token 和 .env 里的不一样。换过 Token 的话运行 edge certs token"
+    echo "  .env：$REALITY_CERT_DOMAIN，Token $(mask_token "$CF_Token")"
+}
+
+# certs_offer_prune：有没人用的证书就问一次：同意 → 检查后直接删；不同意 → 告诉你以后用什么命令
+certs_offer_prune() {
+    local list=()
+    mapfile -t list < <(cert_unused)
+    [ ${#list[@]} -gt 0 ] || return 0
+    echo
+    warn "这些证书已经没有站点在用，acme.sh 还在续签它们：${list[*]}"
+    if [ -t 0 ] && confirm "先确认不影响现有网站，再停止续签并删除？"; then
+        (certs_prune --yes "${list[@]}") || warn "没有删除（原因见上面）"
+    else
+        log "暂不删除。以后要删：edge certs prune ${list[*]}（加 --revoke 同时注销）"
     fi
 }
 
-# certs_prune [根域名...] [--revoke]：不带域名 = 所有没有站点在用的证书
+# certs_prune [根域名...] [--revoke] [--yes]：不带域名 = 所有没人用的证书；--yes 不再问（调用方已经问过）
 certs_prune() {
-    local revoke=0 a d u list=()
+    local revoke=0 yes=0 a d u list=()
     for a in "$@"; do
         case "$a" in
             --revoke) revoke=1 ;;
+            --yes)    yes=1 ;;
             -*)       die "不认识的参数：$a" ;;
             *)        list+=("$a") ;;
         esac
     done
     if [ ${#list[@]} -eq 0 ]; then
-        while read -r d; do
-            [ -n "$d" ] && [ -z "$(cert_users "$d")" ] && list+=("$d")
-        done < <(cert_all)
+        mapfile -t list < <(cert_unused)
         [ ${#list[@]} -gt 0 ] || { log "每张证书都有站点在用，没有要清理的"; return 0; }
         echo "这些证书已经没有站点在用："
         printf '  %s\n' "${list[@]}"
-        [ -t 0 ] || die "不在终端里运行时要写明删哪些：edge certs prune ${list[*]}"
+        [ -t 0 ] || [ "$yes" = 1 ] || die "不在终端里运行时要写明删哪些：edge certs prune ${list[*]}"
     fi
-    # 先全部检查一遍，有一个不能删就一个都不动
+    # 第一道检查：配置文件里没有任何地方引用它；有一个不能删就一个都不动
     for d in "${list[@]}"; do
         [[ "$d" =~ $DOMAIN_RE ]] || die "域名格式不对：$d"
         u="$(cert_users "$d" | paste -sd' ')"
         [ -z "$u" ] || die "$d 的证书还在用：$u（先把这些网站换成新域名或 edge remove，伪装站改 .env 后 edge apply）"
         [ -d "$EDGE_DIR/certs/$d" ] || acme_managed "$d" || die "没有 $d 的证书（edge certs 查看）"
     done
-    if [ -t 0 ]; then
+    if [ "$yes" = 0 ] && [ -t 0 ]; then
         if [ "$revoke" = 1 ]; then
             confirm "注销并删除 ${list[*]} 的证书（停止自动续签）？" || { log "已取消"; return 0; }
         else
             confirm "停止自动续签并删除 ${list[*]} 的证书？" || { log "已取消"; return 0; }
         fi
     fi
+    # 第二道检查：真的把证书挪走，让 nginx 检查一遍配置，通过了才删
+    certs_dry_run "${list[@]}"
     for d in "${list[@]}"; do cert_drop "$d" "$revoke"; done
-    log "完成：edge certs 查看剩下的证书。旧域名的 DNS 记录和 Token 要到 Cloudflare 上自己删"
+    log "完成：edge certs 查看剩下的证书。旧域名的 DNS 记录、不再用的 Token 要到 Cloudflare 上自己删"
+}
+
+# certs_dry_run <根域名...>：把这些证书目录临时挪走，跑 nginx -t，然后马上挪回来。
+# 检查通过 = 没有这些证书 nginx 照样能加载配置，删掉不影响网站；不通过就退出，什么都不删
+certs_dry_run() {
+    local d err rc tmp=".prune-check-$$" moved=()
+    if ! nginx_running; then
+        warn "nginx 没在运行，没法实际演练，只按配置文件检查过"
+        return 0
+    fi
+    err="$(docker exec nginx nginx -t -q 2>&1)" \
+        || die "nginx 现在的配置本身就检查不通过，先修好再清理证书：$err"
+    for d in "$@"; do
+        if [ -d "$EDGE_DIR/certs/$d" ]; then
+            mv "$EDGE_DIR/certs/$d" "$EDGE_DIR/certs/$tmp-$d"
+            moved+=("$d")
+        fi
+    done
+    err="$(docker exec nginx nginx -t -q 2>&1)" && rc=0 || rc=$?
+    for d in "${moved[@]}"; do mv "$EDGE_DIR/certs/$tmp-$d" "$EDGE_DIR/certs/$d"; done
+    [ "$rc" -eq 0 ] || die "把 $* 的证书挪走后 nginx 配置检查不通过，说明还有地方在用，一个都没删：$err"
+    log "演练通过：没有这些证书 nginx 配置照样正常，删除不影响现有网站"
 }
 
 cert_drop() {  # cert_drop <根域名> <注销 0|1>
@@ -724,45 +1046,6 @@ cert_drop() {  # cert_drop <根域名> <注销 0|1>
     if [ -d "$EDGE_DIR/certs/$d" ]; then
         rm -rf "${EDGE_DIR:?}/certs/$d"
         log "已删除 certs/$d"
-    fi
-}
-
-# certs_token：把 .env 里的 CF_Token 交给自动续签。先确认它能管理所有在用证书的域名，不能就不改
-certs_token() {
-    local t="$CF_Token" d f zone rc bad=() unused=()
-    [ -n "$t" ] || die ".env 里 CF_Token 为空"
-    [[ "$t" =~ ^[A-Za-z0-9_-]+$ ]] || die ".env 里的 CF_Token 有奇怪的字符，检查是不是复制多了空格或引号"
-    [ -x "$ACME" ] || die "还没有安装 acme.sh：先运行 edge install"
-    log "检查 .env 里的 Token（$(mask_token "$t")）能不能续签每张在用的证书"
-    while read -r d; do
-        [ -n "$d" ] || continue
-        if [ -z "$(cert_users "$d")" ]; then unused+=("$d"); continue; fi
-        rc=0; zone="$(cf_zone_of "$d")" || rc=$?
-        case "$rc" in
-            0) printf '  OK  %-28s（Cloudflare 上的域名：%s）\n' "$d" "$zone" ;;
-            1) printf '  ✗   %-28s 这个 Token 看不到它\n' "$d"; bad+=("$d") ;;
-            3) die "Token 无效或权限不够：需要 Zone → Zone → Read 和 Zone → DNS → Edit" ;;
-            *) die "查询 Cloudflare 失败（网络不通，或者没装 jq），稍后再试" ;;
-        esac
-    done < <(cert_all)
-    if [ ${#bad[@]} -gt 0 ]; then
-        die "新 Token 续签不了 ${bad[*]}：到 Cloudflare 把它们加进这个 Token 的 Zone Resources；已经不用的先换掉网站再 edge certs prune。续签设置没有改"
-    fi
-
-    [ -f "$ACME_ACCOUNT_CONF" ] || die "找不到 $ACME_ACCOUNT_CONF（acme.sh 没装好？运行 edge install）"
-    cp -p "$ACME_ACCOUNT_CONF" "$ACME_ACCOUNT_CONF.bak"
-    acme_conf_set "$ACME_ACCOUNT_CONF" SAVED_CF_Token "$t"
-    # 直接写在 account.conf 里的 CF_Token= 会被 acme.sh 当成环境变量读进去，优先级比 SAVED_ 高，去掉
-    sed -i '/^CF_Token=/d' "$ACME_ACCOUNT_CONF"
-    # edge 的证书里单独存过 Token 的（用了 CF_Zone_ID 时 acme.sh 会这样存），也一起换掉；你自己另外签的不动
-    while read -r d; do
-        f="$ACME_HOME/${d}_ecc/$d.conf"
-        [ -n "$d" ] && [ -f "$f" ] && grep -q '^CF_Token=' "$f" && acme_conf_set "$f" CF_Token "$t"
-    done < <(cert_all)
-    log "已更新：以后自动续签都用这个 Token（旧设置备份在 $ACME_ACCOUNT_CONF.bak）"
-    log "确认 edge certs 里没有 ≠ .env 之后，旧 Token 可以到 Cloudflare 删掉了"
-    if [ ${#unused[@]} -gt 0 ]; then
-        warn "${unused[*]} 没有站点在用，新 Token 可能续签不了它们，到时会一直报错：确认不要了就 edge certs prune"
     fi
 }
 
@@ -1382,7 +1665,8 @@ menu_edge() {
  11) 轮换 Xray 密钥
  12) 查看 Xray 配置
  13) 账号 / 出口 / 内网入口（多账号、链式代理）
- 14) 证书（换了域名 / Token 后清理旧证书、同步 Token）
+ 14) 证书（谁在用、续签 Token、清理旧证书）
+ 15) 网站 / 节点换域名
   0) 退出
 EOF
         read -rp "请选择: " c || exit 0
@@ -1404,14 +1688,8 @@ EOF
             11) bash "$SELF" rotate-keys ;;
             12) bash "$SELF" xray ;;
             13) menu_chain ;;
-            14) bash "$SELF" certs
-                echo
-                echo "  1) 清理没有站点在用的证书    2) 把 .env 里的 CF Token 交给自动续签    留空 = 返回"
-                read -rp "请选择: " a
-                case "$a" in
-                    1) bash "$SELF" certs prune ;;
-                    2) bash "$SELF" certs token ;;
-                esac ;;
+            14) bash "$SELF" certs ;;
+            15) bash "$SELF" rename ;;
             0|q|"") exit 0 ;;
             *) warn "没有这个选项" ;;
         esac || true
@@ -1475,10 +1753,11 @@ case "$cmd" in
     up)          cmd_up "$@" ;;
     theme)       cmd_theme "$@" ;;
     remove|rm)   cmd_remove "$@" ;;
+    rename|mv)   cmd_rename "$@" ;;
     sites|ls)    cmd_sites ;;
     check)       bash "$S/check.sh" ;;
     client)      bash "$S/show-client.sh" "$@" ;;
-    apply)       bash "$S/02-init.sh" ;;
+    apply)       cmd_apply ;;
     update)      cmd_update ;;
     rotate-keys) cmd_rotate ;;
     logs)        cmd_logs "$@" ;;

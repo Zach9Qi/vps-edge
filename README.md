@@ -109,22 +109,22 @@ vps-edge/                       → 上传到 VPS 的 /opt/edge
 | 命令 | 菜单项 | 作用 |
 |---|---|---|
 | `edge install` | 10 | 一键安装 / 修复。可以重复执行：已有的密钥、证书、配置、应用都会复用，不会让客户端失效 |
-| `edge add <域名> <应用名>` | 3 | 发布 `apps/<应用名>`：自动分配端口、构建启动、签证书（需要时）、配好 HTTPS |
+| `edge add <域名> <应用名> [--token <Token>]` | 3 | 发布 `apps/<应用名>`：自动分配端口、构建启动、签证书（需要时）、配好 HTTPS。新的根域名会问你要它的 Token（不在终端里用 `--token`），见 7.1 节 |
 | `edge add <域名> <端口>` | 3 | 反代到一个已经在运行的服务 |
 | `edge up [应用名]` | 6 | 应用重新构建、重启（会先拉取最新基础镜像）；不带参数 = 全部应用 |
 | `edge theme [主题名]` | 7 | 切换伪装站主题：不带参数列出所有主题按序号选，切换后自动重新构建 |
+| `edge rename [旧域名] [新域名] [--token <Token>]` | 15 | 网站或节点（伪装站）换域名：先上线新域名、本机确认能访问，再删旧的；旧 DNS 记录和旧证书会问你要不要删，见 7.1 节 |
 | `edge remove [域名]` | 4 | 删除网站，对应的应用没有其他网站在用时一并停止（目录保留） |
 | `edge sites` | 5 | 查看已有网站、各自的后端和应用 |
 | `edge check` | 1 | 检查容器、端口、证书剩余天数、伪装站、各站点、对外暴露的端口 |
 | `edge client [--all]` | 2 | 打印 `default` 账号的分享链接和 mihomo 配置片段；`--all` 再列出其他每个账号的链接（公网 `vless://`，开了内网入口时还有内网 `ss://`） |
-| `edge apply` | 8 | 改了 `.env` 或模板之后重新生成配置，自动重载（密钥不变） |
+| `edge apply` | 8 | 改了 `.env` 或模板之后重新生成配置，自动重载（密钥不变）；先检查 `.env` 的 Token 能管理 `REALITY_CERT_DOMAIN`（不能就拒绝），续签 Token 不一样才改；没人用的旧证书检查后问你要不要删，见 7.1 节 |
 | `edge update` | 9 | 拉取 nginx / Xray 新镜像并重启，再 `edge up` 全部应用 |
 | `edge rotate-keys` | 11 | 轮换 Xray 密钥和所有账号的 UUID（所有链接都失效，需要重新导入） |
 | `edge logs [nginx\|xray]` | | 实时查看日志 |
 | `edge xray [--raw]` | 12 | 查看 Xray 实际配置（私钥、密码默认隐藏，`--raw` 显示完整），并提示配置是否已生效 |
-| `edge certs` | 14 | 查看每张证书：哪些域名在用、剩余天数、自动续签用哪个 Cloudflare Token，见 7.1 节 |
-| `edge certs prune [根域名...] [--revoke]` | 14 → 1 | 停止自动续签并删除没有站点在用的证书（不带域名 = 全部没人用的；`--revoke` 同时注销） |
-| `edge certs token` | 14 → 2 | 把 `.env` 里的新 `CF_Token` 交给自动续签（先检查它能管理所有在用证书的域名） |
+| `edge certs` | 14 | 查看每张证书：哪些域名在用、剩余天数、续签用的 Token；有没人用的证书会问你要不要删，见 7.1 节 |
+| `edge certs prune [根域名...] [--revoke]` | | 停止自动续签并删除没人用的证书（不带域名 = 全部没人用的；先演练确认不影响网站才删；`--revoke` 同时注销） |
 | `edge chain` | 13 | 账号 / 出口 / 内网入口菜单 |
 | `edge exit ...` | 13 → 1~4 | 添加 / 查看测试 / 更换 / 删除出口（另一台机器、第三方代理），见 8.6 节 |
 | `edge user ...` | 13 → 5~10 | 添加 / 查看链接 / 改出口 / 测试 / 删除 / 改名账号，每个账号走自己的出口，见 8.6 节 |
@@ -219,6 +219,7 @@ edge 会依次：从 3001 开始找一个空闲端口 → 按这个端口构建�
 | 改了代码 / 页面 | `edge up blog`（拉取最新基础镜像、重新构建、重启；端口不变） |
 | 一次更新全部应用 | `edge up` |
 | 同一个应用再绑一个域名 | `edge add www.blog.com blog`（复用同一个容器和端口） |
+| 网站换域名 | `edge rename old.blog.com new.blog.com`（先上线新的、确认能访问，再删旧的，见 7.1 节） |
 | 下线 | `edge remove blog.example.com`：删掉网站，并停止 `apps/blog` 的容器（目录保留，再 `edge add` 即可恢复） |
 
 应用和端口的对应关系记在 `nginx/conf.d/<域名>.conf` 的第一行（`# app=blog`）和 `proxy_pass` 里，不要删这一行。`apps/` 下的 compose 不要手动 `docker compose up`（拿不到 `APP_PORT`），统一用 `edge up`。
@@ -241,7 +242,7 @@ edge add app.example.com 3001     # 服务自己管理，端口要写成 127.0.0
 
 ### 说明
 
-- 证书自动处理：已有能覆盖它的泛域名证书就直接用；没有（比如另一个根域名 `app.foo.com`，或二级子域名 `a.b.example.com`）就自动签一张新的。新根域名需要托管在 Cloudflare，且 Token 的 Zone Resources 包含它
+- 证书自动处理：已有能覆盖它的泛域名证书就直接用；没有（比如另一个根域名 `app.foo.com`，或二级子域名 `a.b.example.com`）就自动签一张新的。新根域名需要托管在 Cloudflare。用哪个 Token 看域名自己的根域名：和伪装站同一个根域名用 `.env` 的 `CF_Token`；已经有这个根域名的证书就用证书存的 Token；新的根域名（可以在另一个 Cloudflare 账号）会让你粘贴一个，签好后存在这张证书里，不写进 `.env`
 - nginx 配置检查不通过会自动撤销，不会把 nginx 弄坏
 - 需要特殊配置（大文件上传、多个 location、静态目录等）的站点，生成后直接编辑 `nginx/conf.d/<域名>.conf`，然后执行 `bash scripts/reload-nginx.sh`
 - 删除站点：`edge remove`
@@ -290,7 +291,7 @@ stream 分流规则和 Xray 配置都不用改：不是伪装站域名的流量�
 |---|---|
 | 定时任务 | acme.sh 安装时会在 root 的 crontab 里加一条每日任务（`crontab -l` 可以看到） |
 | 验证方式 | DNS-01：通过 Cloudflare API 写 `_acme-challenge` TXT 记录，验证完自动删除，只有出站请求 |
-| 凭据 | 签发时用的 `CF_Token` 保存在 `~/.acme.sh/account.conf`（`SAVED_CF_Token`），**所有证书共用一个，最后一次签发用的覆盖之前的**；续签只用它，不读 `.env` |
+| 凭据 | **每张证书各存一份 Token**：`~/.acme.sh/<根域名>_ecc/<根域名>.conf` 里的 `CF_Token` / `CF_Zone_ID`，续签只用它，不读 `.env`。不同证书的 Token 互不影响；`edge apply` 只会更新 `REALITY_CERT_DOMAIN` 那张 |
 | 安装 | 新证书写到 `certs/<根域名>/`，nginx 以只读方式挂载 |
 | 生效 | 执行 `scripts/reload-nginx.sh`：先 `nginx -t` 检查，再平滑 reload |
 
@@ -309,34 +310,43 @@ export TELEGRAM_BOT_APITOKEN="..." TELEGRAM_BOT_CHATID="..."
 ~/.acme.sh/acme.sh --set-notify --notify-hook telegram --notify-level 2
 ```
 
-Token 被删除或权限被修改都会导致续期失败；`edge check` 会在证书剩余不足 15 天时报警，有证书没人用、续签 Token 和 `.env` 不一致时也会提醒。
+Token 被删除或权限被修改都会导致续期失败；`edge check` 会在证书剩余不足 15 天时报警，有证书没人用、伪装站证书的续签 Token 和 `.env` 不一致时也会提醒。
 
 ### 7.1 换域名、换 Cloudflare Token
 
-证书按根域名签（`X` 和 `*.X`），换了域名以后**旧证书不会自动删掉**，acme.sh 会一直续签它，旧域名从 Cloudflare 删掉之后就一直续签失败；换了 `CF_Token` 以后，**续签用的还是 acme.sh 存下来的旧 Token**。`edge certs`（菜单 14）处理这两件事：
+`.env` 里的 `CF_Token` 和 `REALITY_CERT_DOMAIN` 永远填最新的。每张证书的续签 Token 各存一份（不在 `.env` 里），一个域名用哪个 Token 看它自己的根域名：
+
+| 域名 | 用的 Token |
+|---|---|
+| 和 `REALITY_CERT_DOMAIN` 同一个根域名（伪装站、`blog.<根域名>`、`a.b.<根域名>`） | `.env` 的 `CF_Token` |
+| 其他根域名（可以在另一个 Cloudflare 账号） | 这个根域名的证书自己存的 Token：第一次 `edge add` 时让你粘贴，签好后存在证书里 |
+
+`edge apply` 会：
+
+1. **先检查**：`.env` 的 Token 能不能管理 `REALITY_CERT_DOMAIN`（看得到这个域名、有 DNS 编辑权限）。不能就直接拒绝，什么都不改
+2. **再比较**：和 `.env` 同一个根域名的证书，现在续签用的 Token 和 `.env` 一样就不动，不一样才换成 `.env` 的。其他根域名的证书各自的 Token 不动
+3. **清理旧证书**：换了域名以后没人用的证书，问你要不要删。同意就直接删（停止续签 + 删除文件）；不同意会告诉你以后用哪条命令。删除前有两道检查，任何一道不过都一个都不删：
+   - 配置文件里没有任何地方引用它（伪装站、所有网站、nginx 主配置和公共片段、`apps/` 的 compose；改了 `.env` 还没 apply 的伪装站也算在用）
+   - 把证书目录临时挪走，让 nginx 实际跑一遍 `nginx -t`，通过才删
 
 ```
 $ edge certs
 == 证书（按根域名，每张覆盖 X 和 *.X）==
-  new.com                      剩余 89 天  自动续签，Token abcd…wxyz
+  new.com                      剩余 89 天  自动续签，Token abcd…wxyz（和 .env 一致）
       在用：www.new.com（伪装站）
-      在用：blog.new.com
-  old.com                      剩余 41 天  自动续签，Token 1234…5678（≠ .env）
+  old.com                      剩余 41 天  自动续签，Token 1234…5678
       没有站点在用
 ```
 
-把伪装站域名（`REALITY_SNI`）换成另一个根域名、同时换 Token 的完整步骤：
+**换域名：`edge rename <旧域名> <新域名>`**（菜单 15，不带参数会列出来让你选）。新域名用哪个 Token 和 `edge add` 一样，新的根域名会问你要（不在终端里用 `--token`）；DNS 记录会自动建。
 
-1. Cloudflare：新建 Token（`Zone → DNS → Edit`、`Zone → Zone → Read`），Zone Resources 选新域名，**以及所有还要继续用的根域名**；给新域名加灰云 A/AAAA 记录
-2. 改 `.env`：`CF_Token`、`REALITY_SNI`、`REALITY_CERT_DOMAIN`
-3. `edge apply`：新根域名还没有证书，会用新 Token 自动签发
-4. 旧根域名下还有网站的，先 `edge add <新域名> <应用名>` 再 `edge remove <旧域名>`
-5. `edge client` 拿新链接，客户端重新导入（或者只把 SNI 改成新域名，UUID、公钥、shortId 不变）
-6. `edge certs prune`：列出没人用的证书，确认后停止续签并删除
-7. `edge certs token`：检查新 Token 能管理每张在用证书的域名，通过才写进 acme.sh 的续签设置
-8. `edge certs` 里没有 `≠ .env` 之后，到 Cloudflare 删掉旧 Token 和旧域名的 DNS 记录
+- **网站**：复制旧的站点配置，只改 `server_name` 和证书路径（手动改过的内容原样保留）→ 新域名上线 → 在本机访问 `https://新域名` 确认能打开、证书正确 → 再删旧域名（对应的应用继续跑）。任何一步失败都撤回，旧域名照常
+- **节点（伪装站，`REALITY_SNI`）**：自动改 `.env` 的 `REALITY_SNI`、`REALITY_CERT_DOMAIN`（新根域名还会把 `CF_Token` 换成你给的）→ 走一遍 `edge apply` 的检查和生成。失败就恢复 `.env`，节点照常。成功后打印新链接，**所有客户端要重新导入**（或者只把 SNI 改成新域名，UUID、公钥、shortId 不变）
+- 最后都会问：要不要删掉旧域名指向本机的 DNS 记录（指向别处的不动），要不要删掉没人用的旧证书
 
-只换网站域名（同一个根域名下）不涉及证书，第 4 步就够了。旧证书一般不需要注销，停止续签后 90 天内自然过期；怀疑私钥泄露时才用 `edge certs prune <根域名> --revoke`。
+手动改 `.env` 再 `edge apply` 也可以，效果一样，只是旧 DNS 记录要自己去 Cloudflare 删。
+
+旧证书一般不需要注销，停止续签后 90 天内自然过期；怀疑私钥泄露时才用 `edge certs prune <根域名> --revoke`。
 
 ---
 

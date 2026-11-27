@@ -4,14 +4,23 @@
 # 用法：
 #   bash scripts/03-issue-cert.sh               # 签发 .env 里的 REALITY_CERT_DOMAIN
 #   bash scripts/03-issue-cert.sh foo.com       # 再签发另一个根域名（需托管在 Cloudflare 且 Token 有权限）
+#   ISSUE_CF_TOKEN=<Token> bash scripts/03-issue-cert.sh foo.com   # 用指定的 Token（edge add 给其他根域名签时用）
 . "$(cd "$(dirname "$0")" && pwd)/lib.sh"
 require_root
 load_env
 
 DOMAIN="${1:-$REALITY_CERT_DOMAIN}"
 [[ "$DOMAIN" =~ ^[A-Za-z0-9.-]+\.[A-Za-z]{2,}$ ]] || die "域名格式不对：$DOMAIN"
-[ -n "$CF_Token" ] || die ".env 里 CF_Token 为空"
 [ -n "$ACME_EMAIL" ] || die ".env 里 ACME_EMAIL 为空"
+
+# 默认用 .env 里的 CF_Token；edge add 给其他根域名签证书时，用 ISSUE_CF_TOKEN 传那个根域名自己的
+SRC=".env 里的 CF_Token"
+if [ -n "${ISSUE_CF_TOKEN:-}" ]; then CF_Token="$ISSUE_CF_TOKEN"; SRC="指定的 Token"; fi
+[ -n "$CF_Token" ] || die ".env 里 CF_Token 为空"
+# 先确认 Token 能管理这个域名，顺便拿到 zone id
+out="$(cf_token_zone "$CF_Token" "$DOMAIN")" && rc=0 || rc=$?
+[ "$rc" -eq 0 ] || die "$SRC 不能用来签 $DOMAIN：$(cf_token_err "$rc" "$DOMAIN")"
+CF_Zone_ID="${out%% *}"
 
 # ---------- 安装 acme.sh ----------
 if [ ! -x "$ACME" ]; then
@@ -23,8 +32,8 @@ fi
 "$ACME" --set-default-ca --server letsencrypt >/dev/null
 
 # ---------- 签发 ----------
-# CF_Token 会被 acme.sh 保存到 ~/.acme.sh/account.conf，之后续期自动使用
-export CF_Token
+# 同时传 CF_Token 和 CF_Zone_ID：acme.sh 把它们存在这张证书自己的配置里，续签只用它，不影响别的证书
+export CF_Token CF_Zone_ID
 log "签发 $DOMAIN 和 *.$DOMAIN（DNS-01 / Cloudflare）"
 set +e
 "$ACME" --issue --dns dns_cf -d "$DOMAIN" -d "*.$DOMAIN" --keylength ec-256
@@ -44,6 +53,8 @@ mkdir -p "$CERT_DIR"
     --fullchain-file "$CERT_DIR/fullchain.pem" \
     --reloadcmd      "bash $EDGE_DIR/scripts/reload-nginx.sh"
 chmod 600 "$CERT_DIR/key.pem"
+# 证书还没到续期时间（跳过了签发）时 acme.sh 不会更新存的 Token，这里补一次
+cert_set_token "$DOMAIN" "$CF_Token" "$CF_Zone_ID" || warn "没找到 acme.sh 里 $DOMAIN 的配置，续签 Token 没有写进去"
 
 # 确保续期 cron 存在
 "$ACME" --install-cronjob >/dev/null 2>&1 || true
